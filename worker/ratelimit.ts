@@ -21,6 +21,13 @@ export type Tier = keyof typeof LIMITS;
 // be driven into a long ban by ordinary traffic.
 const LOCKOUTS_MS = [60_000, 15 * 60_000, 60 * 60_000];
 
+// A client that fires ten retries in two seconds has ignored Retry-After
+// once, not ten times. Counting each request as its own defiance conflates
+// burst size with persistence, and escalated a naive retry loop to the
+// one-hour tier almost instantly. Only the first request in this window
+// counts.
+const DEFIANCE_WINDOW_MS = 30_000;
+
 interface BucketState {
   tokens: number;
   refilledAt: number;
@@ -46,12 +53,17 @@ export class BucketMeter {
     const s = await this.load(limit, now);
 
     if (s.lockoutUntil > now) {
-      // Requesting while locked out is the actual abuse signal.
+      // Requesting while locked out is the actual abuse signal, but only
+      // once per DEFIANCE_WINDOW_MS. Skipping the write for burst retries
+      // also spares a Durable Object storage op per request.
       s.defiances = s.defiances.filter((t) => now - t < DAY_MS);
-      s.defiances.push(now);
-      const idx = Math.min(s.defiances.length - 1, LOCKOUTS_MS.length - 1);
-      s.lockoutUntil = Math.max(s.lockoutUntil, now + LOCKOUTS_MS[idx]);
-      await this.save(s);
+      const last = s.defiances.length ? s.defiances[s.defiances.length - 1] : 0;
+      if (now - last > DEFIANCE_WINDOW_MS) {
+        s.defiances.push(now);
+        const idx = Math.min(s.defiances.length - 1, LOCKOUTS_MS.length - 1);
+        s.lockoutUntil = Math.max(s.lockoutUntil, now + LOCKOUTS_MS[idx]);
+        await this.save(s);
+      }
       return this.reply(s, limit, now, false);
     }
 

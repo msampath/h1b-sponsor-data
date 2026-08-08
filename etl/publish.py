@@ -8,6 +8,10 @@ Usage:
     python etl/publish.py --dry-run     # count objects and bytes, upload nothing
     python etl/publish.py               # upload changed objects only
     python etl/publish.py --force       # ignore the manifest, upload everything
+    python etl/publish.py --resume      # after an interrupted run: list the
+                                        # bucket and skip what already landed
+    python etl/publish.py --limit 200   # exercise the real upload path at
+                                        # small scale before a full run
 
 Uploads are manifest-diffed (key -> sha256) because R2's free tier allows
 1M Class A operations per month and a full publish is ~694k of them.
@@ -19,6 +23,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from itertools import groupby
@@ -66,13 +71,18 @@ def body(obj) -> bytes:
 
 
 class Publisher:
-    def __init__(self, dry_run: bool, force: bool):
+    def __init__(self, dry_run: bool, force: bool, resume: bool = False, limit: int = 0):
         self.dry_run = dry_run
         self.force = force
+        self.resume = resume
+        self.limit = limit
         self.manifest: dict[str, str] = {}
         self.next_manifest: dict[str, str] = {}
+        self.existing: set[str] = set()
+        self.failed: list[tuple[str, bytes]] = []
         self.n_objects = 0
         self.n_uploaded = 0
+        self.n_skipped = 0
         self.n_bytes = 0
         self.client = None
         self.bucket = None
@@ -83,6 +93,7 @@ class Publisher:
         if self.dry_run:
             return
         import boto3
+        from botocore.config import Config
 
         account = os.environ["R2_ACCOUNT_ID"]
         self.bucket = os.environ.get("R2_BUCKET", "h1b-sponsor-data")
@@ -92,6 +103,12 @@ class Publisher:
             aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
             aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
             region_name="auto",
+            # R2 returns transient InternalError under sustained concurrency.
+            # The default of 4 attempts is not enough for a 700k object run.
+            config=Config(
+                retries={"max_attempts": 10, "mode": "adaptive"},
+                max_pool_connections=UPLOAD_THREADS * 2,
+            ),
         )
         if not self.force:
             try:
@@ -101,7 +118,28 @@ class Publisher:
             except Exception:
                 print("manifest: none found, treating as first publish")
 
+        if self.resume and not self.manifest:
+            # The manifest is only written at the end, so an interrupted run
+            # leaves objects in the bucket with no record of them. Listing is
+            # ~450 Class A ops against ~450k re-uploads, so seed from the
+            # bucket instead. Presence is sufficient here because object
+            # content is deterministic for a given build; --resume is opt-in
+            # precisely so this never silently skips genuinely changed objects
+            # on a later rebuild.
+            print("resume: listing bucket to find what already landed ...", flush=True)
+            pager = self.client.get_paginator("list_objects_v2")
+            for page in pager.paginate(Bucket=self.bucket):
+                for o in page.get("Contents", []):
+                    self.existing.add(o["Key"])
+            print(f"resume: {len(self.existing):,} objects already present")
+
     def put(self, key: str, data: bytes):
+        # --limit exists because --dry-run returns before anything is queued,
+        # so it never executes flush(), _put_one(), or the manifest write. A
+        # clean dry-run says nothing about whether uploading works. This runs
+        # the real path against a handful of objects instead.
+        if self.limit and self.n_objects >= self.limit:
+            return
         self.n_objects += 1
         self.n_bytes += len(data)
         digest = hashlib.sha256(data).hexdigest()
@@ -110,35 +148,76 @@ class Publisher:
             return
         if not self.force and self.manifest.get(key) == digest:
             return
+        if not self.force and key in self.existing:
+            self.n_skipped += 1
+            return
         self._pending.append((key, data))
         if len(self._pending) >= 2000:
             self.flush()
+
+    def _put_one(self, item):
+        """Upload with backoff. A single object must never kill the run."""
+        key, data = item
+        for attempt in range(5):
+            try:
+                self.client.put_object(
+                    Bucket=self.bucket, Key=key, Body=data,
+                    ContentType="application/json",
+                )
+                return None
+            except Exception:
+                if attempt == 4:
+                    return item
+                time.sleep(2 ** attempt * 0.5)
+        return item
 
     def flush(self):
         if self.dry_run or not self._pending:
             self._pending = []
             return
         batch, self._pending = self._pending, []
-
-        def one(item):
-            key, data = item
-            self.client.put_object(
-                Bucket=self.bucket, Key=key, Body=data,
-                ContentType="application/json",
-            )
-
         with ThreadPoolExecutor(max_workers=UPLOAD_THREADS) as pool:
-            list(pool.map(one, batch))
-        self.n_uploaded += len(batch)
-        print(f"  uploaded {self.n_uploaded:,} / seen {self.n_objects:,}", flush=True)
+            failures = [f for f in pool.map(self._put_one, batch) if f]
+        self.failed.extend(failures)
+        self.n_uploaded += len(batch) - len(failures)
+        note = f"  uploaded {self.n_uploaded:,} / seen {self.n_objects:,}"
+        if self.n_skipped:
+            note += f" / skipped {self.n_skipped:,}"
+        if self.failed:
+            note += f" / FAILED {len(self.failed):,}"
+        print(note, flush=True)
 
     def finish(self):
         self.flush()
-        if not self.dry_run:
-            self.client.put_object(
-                Bucket=self.bucket, Key=MANIFEST_KEY,
-                Body=body(self.next_manifest), ContentType="application/json",
-            )
+        if self.dry_run:
+            return
+        # One more pass at anything that exhausted its retries. These are
+        # transient R2 errors, so a second attempt after the burst usually
+        # clears them.
+        if self.failed:
+            print(f"retrying {len(self.failed):,} failed objects ...", flush=True)
+            retry, self.failed = self.failed, []
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                self.failed = [f for f in pool.map(self._put_one, retry) if f]
+            self.n_uploaded += len(retry) - len(self.failed)
+        # --limit only ever sees the first N objects, so its next_manifest is
+        # a tiny fraction of reality. Writing it would clobber the real
+        # manifest and make the following run believe almost nothing had been
+        # published.
+        if self.limit:
+            print("limit run: manifest not written")
+            return
+        # Only claim a key in the manifest if it actually made it up, or a
+        # later run would skip an object that was never written.
+        bad = {k for k, _ in self.failed}
+        self.client.put_object(
+            Bucket=self.bucket, Key=MANIFEST_KEY,
+            Body=body({k: v for k, v in self.next_manifest.items() if k not in bad}),
+            ContentType="application/json",
+        )
+        if self.failed:
+            print(f"WARNING: {len(self.failed):,} objects still failed. "
+                  f"Re-run with --resume to pick them up.")
 
 
 def stream(conn, sql: str, name: str, size: int = 10_000):
@@ -153,6 +232,10 @@ def main() -> int:
     load_dotenv(ROOT / ".env")
     dry = "--dry-run" in sys.argv
     force = "--force" in sys.argv
+    resume = "--resume" in sys.argv
+    limit = 0
+    if "--limit" in sys.argv:
+        limit = int(sys.argv[sys.argv.index("--limit") + 1])
 
     conn = psycopg2.connect(
         host=os.environ["POSTGRES_HOST"],
@@ -162,7 +245,7 @@ def main() -> int:
         dbname=os.environ.get("SOURCE_DB", "lca"),
     )
 
-    p = Publisher(dry, force)
+    p = Publisher(dry, force, resume, limit)
     p.connect_r2()
 
     # ── employer profiles ────────────────────────────────────────────────
