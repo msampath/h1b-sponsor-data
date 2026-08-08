@@ -1,39 +1,31 @@
-// BucketMeter — one Durable Object per caller, holding a token bucket plus
-// an escalating lockout for callers that ignore Retry-After.
+// BucketMeter — one Durable Object per caller, holding a token bucket.
 //
-// There is deliberately no global meter. An earlier design ticked a
-// singleton on every request, which (a) burned two DO calls per request
-// against a 100k/day free-tier quota and (b) let any client drive a
-// service-wide 503 by looping requests that were already being rejected.
-// The Workers 100k/day request cap is the global ceiling instead.
+// There is deliberately no global meter (the Workers 100k/day cap is the
+// global ceiling) and, since the 2026-08-08 review, no escalation ladder.
+// Escalation punished the wrong party: a request during a lockout costs a
+// Worker invocation whether or not we extend the lockout, so extending never
+// saved quota — but three ordinary requests spaced >30s during one cool-off
+// (a shared NAT, a CGNAT carrier) escalated the whole address to an hour.
+// The bucket itself is the protection; the only job of a 429 is to say,
+// honestly, when to come back.
 
 import type { DurableObjectState } from "@cloudflare/workers-types";
 
 const HOUR_MS = 3600 * 1000;
-const DAY_MS = 24 * HOUR_MS;
 
 export const LIMITS = { anon: 30, keyed: 200 } as const;
 export type Tier = keyof typeof LIMITS;
 
-// Escalation applies only to requests made *during* an active lockout —
-// i.e. a client that was told to back off and kept going. Simply hitting
-// the hourly cap never escalates, so a shared NAT or CGNAT address can't
-// be driven into a long ban by ordinary traffic.
-const LOCKOUTS_MS = [60_000, 15 * 60_000, 60 * 60_000];
-
-// A client that fires ten retries in two seconds has ignored Retry-After
-// once, not ten times. Counting each request as its own defiance conflates
-// burst size with persistence, and escalated a naive retry loop to the
-// one-hour tier almost instantly. Only the first request in this window
-// counts.
-const DEFIANCE_WINDOW_MS = 30_000;
+// During a lockout, persist at most one state write per this window. The
+// reply does not depend on the write; this only bounds DO storage ops when
+// a client retries in a tight loop.
+const NOTE_WINDOW_MS = 30_000;
 
 interface BucketState {
   tokens: number;
   refilledAt: number;
   lockoutUntil: number;
-  defiances: number[];   // ms epochs of requests made during a lockout
-  lastLimit: number;
+  lastNoteAt: number;
 }
 
 export class BucketMeter {
@@ -48,39 +40,36 @@ export class BucketMeter {
       return new Response("not found", { status: 404 });
     }
     const { tier } = (await request.json()) as { tier: Tier };
+    if (!(tier in LIMITS)) {
+      // Programmer error in the caller, not client traffic. Fail loud; the
+      // Worker's try/catch treats a non-JSON/non-200 DO reply as fail-open.
+      return new Response("unknown tier", { status: 500 });
+    }
     const limit = LIMITS[tier];
     const now = Date.now();
     const s = await this.load(limit, now);
 
     if (s.lockoutUntil > now) {
-      // Requesting while locked out is the actual abuse signal, but only
-      // once per DEFIANCE_WINDOW_MS. Skipping the write for burst retries
-      // also spares a Durable Object storage op per request.
-      s.defiances = s.defiances.filter((t) => now - t < DAY_MS);
-      const last = s.defiances.length ? s.defiances[s.defiances.length - 1] : 0;
-      if (now - last > DEFIANCE_WINDOW_MS) {
-        s.defiances.push(now);
-        const idx = Math.min(s.defiances.length - 1, LOCKOUTS_MS.length - 1);
-        s.lockoutUntil = Math.max(s.lockoutUntil, now + LOCKOUTS_MS[idx]);
+      if (now - s.lastNoteAt > NOTE_WINDOW_MS) {
+        s.lastNoteAt = now;
         await this.save(s);
       }
       return this.reply(s, limit, now, false);
     }
 
-    // Continuous refill: the bucket regains `limit` tokens per hour.
+    // Continuous refill: `limit` tokens per hour.
     const elapsed = now - s.refilledAt;
     if (elapsed > 0) {
       s.tokens = Math.min(limit, s.tokens + (elapsed * limit) / HOUR_MS);
       s.refilledAt = now;
     }
-    if (s.lastLimit !== limit) {
-      s.tokens = Math.min(s.tokens, limit);
-      s.lastLimit = limit;
-    }
 
     if (s.tokens < 1) {
-      // Out of tokens: a short cool-off, no escalation.
-      s.lockoutUntil = now + LOCKOUTS_MS[0];
+      // Honest cool-off: exactly the time until one whole token exists.
+      // Advertising less (a fixed 60s did) re-denies a compliant client
+      // that returns exactly at Retry-After.
+      s.lockoutUntil = now + Math.ceil(((1 - s.tokens) * HOUR_MS) / limit);
+      s.lastNoteAt = now;
       await this.save(s);
       return this.reply(s, limit, now, false);
     }
@@ -92,15 +81,12 @@ export class BucketMeter {
 
   async load(limit: number, now: number): Promise<BucketState> {
     const raw = await this.state.storage.get<BucketState>("s");
-    return (
-      raw ?? {
-        tokens: limit,
-        refilledAt: now,
-        lockoutUntil: 0,
-        defiances: [],
-        lastLimit: limit,
-      }
-    );
+    if (!raw) {
+      return { tokens: limit, refilledAt: now, lockoutUntil: 0, lastNoteAt: 0 };
+    }
+    // A redeploy may lower a tier's limit; clamp so old state can't exceed it.
+    raw.tokens = Math.min(raw.tokens, limit);
+    return raw;
   }
 
   async save(s: BucketState): Promise<void> {

@@ -23,3 +23,6 @@ class_name = "BucketMeter"
 
 # API_KEYS is a secret, not a var:
 #   wrangler secret put API_KEYS      # {"<sha256-of-token>": "career-ops"}
+
+[observability]
+enabled = true

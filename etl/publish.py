@@ -11,21 +11,24 @@ Usage:
     python etl/publish.py --resume      # after an interrupted run: list the
                                         # bucket and skip what already landed
     python etl/publish.py --limit 200   # exercise the real upload path at
-                                        # small scale before a full run
+                                        # small scale (never writes the manifest)
 
-Uploads are manifest-diffed (key -> sha256) because R2's free tier allows
-1M Class A operations per month and a full publish is ~694k of them.
+Uploads are manifest-diffed (key -> sha256): R2's free tier allows 1M Class A
+operations per month and a full publish is ~700k of them. DeleteObject is a
+free-class operation, so the stale-key cleanup pass costs nothing.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
+import re
 import sys
-import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from itertools import groupby
 from pathlib import Path
 
@@ -35,28 +38,31 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_KEY = "_manifest.json"
 SEARCH_CAP = 50          # hits stored per prefix bucket
+MAX_PREFIX_DEPTH = 10    # deepest search tier; must match worker/r2.ts
 UPLOAD_THREADS = 32
 
-
 _KEEP = set("abcdefghijklmnopqrstuvwxyz0123456789 ")
+
+# Exactly JavaScript's \s (worker/r2.ts normalizes with /\s+/). Python's
+# str.split() treats more codepoints as whitespace (FS/GS/RS/US, NEL), which
+# would bucket a name differently on the two sides. Zero current names carry
+# those bytes; this keeps it that way by construction.
+_JS_WS = re.compile(
+    "[ \t\n\v\f\r\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+"
+)
 
 
 def norm_name(s: str) -> str:
     """Must match worker/r2.ts searchPrefix() exactly, or a query lands on a
-    bucket that was never generated and 404s.
-
-    ASCII-only on purpose: str.isalnum() is Unicode-aware, so it would keep
-    'café corp' while the Worker's /[^a-z0-9 ]/ strips it to 'caf corp' —
-    the two sides would bucket accented names differently.
-    """
-    out = " ".join((s or "").lower().split())
+    bucket that was never generated and 404s. Parity is pinned by test
+    vectors duplicated in tests/worker/r2.test.ts and tests/etl."""
+    out = _JS_WS.sub(" ", (s or "").strip().lower())
     return "".join(ch for ch in out if ch in _KEEP)
 
 
 def prefixes(name: str) -> list[str]:
-    """Buckets this name belongs to. The Worker asks for a 3-char prefix when
-    the query has 3+ characters and a 2-char prefix otherwise, so both tiers
-    must exist."""
+    """Base bucket tiers (2- and 3-char) this name belongs to. Deeper tiers
+    are derived later, only where a bucket overflows SEARCH_CAP."""
     c = norm_name(name)
     out = []
     if len(c) >= 2:
@@ -66,16 +72,25 @@ def prefixes(name: str) -> list[str]:
     return out
 
 
+def to_num(v):
+    """numeric(12,2) arrives as Decimal; default=str would emit "123456.00"
+    as a JSON *string*, making wage fields inconsistently typed across the
+    API. Floats are exact for these magnitudes (2 decimal places, < 2^53)."""
+    return float(v) if isinstance(v, Decimal) else v
+
+
 def body(obj) -> bytes:
     return json.dumps(obj, separators=(",", ":"), default=str).encode("utf-8")
 
 
 class Publisher:
-    def __init__(self, dry_run: bool, force: bool, resume: bool = False, limit: int = 0):
+    def __init__(self, dry_run: bool, force: bool, resume: bool = False, limit: int = 0,
+             include: tuple[str, ...] = ()):
         self.dry_run = dry_run
         self.force = force
         self.resume = resume
         self.limit = limit
+        self.include = tuple(include)
         self.manifest: dict[str, str] = {}
         self.next_manifest: dict[str, str] = {}
         self.existing: set[str] = set()
@@ -83,6 +98,7 @@ class Publisher:
         self.n_objects = 0
         self.n_uploaded = 0
         self.n_skipped = 0
+        self.n_deleted = 0
         self.n_bytes = 0
         self.client = None
         self.bucket = None
@@ -94,6 +110,7 @@ class Publisher:
             return
         import boto3
         from botocore.config import Config
+        from botocore.exceptions import ClientError
 
         account = os.environ["R2_ACCOUNT_ID"]
         self.bucket = os.environ.get("R2_BUCKET", "h1b-sponsor-data")
@@ -103,29 +120,36 @@ class Publisher:
             aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
             aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
             region_name="auto",
-            # R2 returns transient InternalError under sustained concurrency.
-            # The default of 4 attempts is not enough for a 700k object run.
+            # R2 returns transient InternalError under sustained concurrency;
+            # adaptive mode also throttles the whole client when errors rise,
+            # instead of 32 threads independently hammering a failing backend.
             config=Config(
                 retries={"max_attempts": 10, "mode": "adaptive"},
                 max_pool_connections=UPLOAD_THREADS * 2,
             ),
         )
+        # Fail fast on bad credentials/bucket rather than 300k objects in.
+        self.client.head_bucket(Bucket=self.bucket)
+
         if not self.force:
             try:
                 raw = self.client.get_object(Bucket=self.bucket, Key=MANIFEST_KEY)
                 self.manifest = json.loads(raw["Body"].read())
                 print(f"manifest: {len(self.manifest):,} known objects")
-            except Exception:
-                print("manifest: none found, treating as first publish")
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if code in ("NoSuchKey", "404"):
+                    print("manifest: none found, treating as first publish")
+                else:
+                    # A 403/500 here is NOT "first publish" — uploading
+                    # everything against a broken config would burn the
+                    # monthly write budget. Surface it.
+                    raise
 
         if self.resume and not self.manifest:
-            # The manifest is only written at the end, so an interrupted run
-            # leaves objects in the bucket with no record of them. Listing is
-            # ~450 Class A ops against ~450k re-uploads, so seed from the
-            # bucket instead. Presence is sufficient here because object
-            # content is deterministic for a given build; --resume is opt-in
-            # precisely so this never silently skips genuinely changed objects
-            # on a later rebuild.
+            # An interrupted first publish leaves objects but no manifest.
+            # Listing is ~700 Class A ops against ~700k re-uploads. Opt-in
+            # because it trusts key presence, valid only mid-interruption.
             print("resume: listing bucket to find what already landed ...", flush=True)
             pager = self.client.get_paginator("list_objects_v2")
             for page in pager.paginate(Bucket=self.bucket):
@@ -134,11 +158,14 @@ class Publisher:
             print(f"resume: {len(self.existing):,} objects already present")
 
     def put(self, key: str, data: bytes):
-        # --limit exists because --dry-run returns before anything is queued,
-        # so it never executes flush(), _put_one(), or the manifest write. A
-        # clean dry-run says nothing about whether uploading works. This runs
-        # the real path against a handful of objects instead.
         if self.limit and self.n_objects >= self.limit:
+            return
+        # --include-prefix defers everything else: a deferred-but-changed key
+        # keeps its OLD manifest digest so the next unfiltered publish still
+        # sees the diff. A deferred NEW key gets no manifest entry at all.
+        if self.include and not any(key.startswith(pre) for pre in self.include):
+            if key in self.manifest:
+                self.next_manifest[key] = self.manifest[key]
             return
         self.n_objects += 1
         self.n_bytes += len(data)
@@ -156,20 +183,19 @@ class Publisher:
             self.flush()
 
     def _put_one(self, item):
-        """Upload with backoff. A single object must never kill the run."""
+        """One attempt per call. boto3's adaptive mode already retries up to
+        10x with client-wide backoff; stacking a sleep loop on top multiplied
+        that into ~50 transport attempts per object. Failures return the item
+        for the single re-pass in finish()."""
         key, data = item
-        for attempt in range(5):
-            try:
-                self.client.put_object(
-                    Bucket=self.bucket, Key=key, Body=data,
-                    ContentType="application/json",
-                )
-                return None
-            except Exception:
-                if attempt == 4:
-                    return item
-                time.sleep(2 ** attempt * 0.5)
-        return item
+        try:
+            self.client.put_object(
+                Bucket=self.bucket, Key=key, Body=data,
+                ContentType="application/json",
+            )
+            return None
+        except Exception:
+            return item
 
     def flush(self):
         if self.dry_run or not self._pending:
@@ -191,30 +217,48 @@ class Publisher:
         self.flush()
         if self.dry_run:
             return
-        # One more pass at anything that exhausted its retries. These are
-        # transient R2 errors, so a second attempt after the burst usually
-        # clears them.
         if self.failed:
             print(f"retrying {len(self.failed):,} failed objects ...", flush=True)
             retry, self.failed = self.failed, []
             with ThreadPoolExecutor(max_workers=8) as pool:
                 self.failed = [f for f in pool.map(self._put_one, retry) if f]
             self.n_uploaded += len(retry) - len(self.failed)
-        # --limit only ever sees the first N objects, so its next_manifest is
-        # a tiny fraction of reality. Writing it would clobber the real
-        # manifest and make the following run believe almost nothing had been
-        # published.
+
+        # A --limit run sees only the first N objects; writing its manifest
+        # would clobber the real one and un-dedupe the next full publish.
         if self.limit:
             print("limit run: manifest not written")
             return
-        # Only claim a key in the manifest if it actually made it up, or a
-        # later run would skip an object that was never written.
+
+        # Delete keys that existed in the previous manifest but were not
+        # produced this run (identity churn between rebuilds would otherwise
+        # leave stale employer objects served forever). DeleteObject is a
+        # free-class R2 operation. Only valid when a manifest was loaded —
+        # under --force/--resume-from-nothing there is no old set to diff.
+        stale = sorted(set(self.manifest) - set(self.next_manifest))
+        if self.include:
+            # only reason about prefixes this run actually produced
+            stale = [k for k in stale if any(k.startswith(pre) for pre in self.include)]
+        for i in range(0, len(stale), 1000):
+            chunk = stale[i : i + 1000]
+            self.client.delete_objects(
+                Bucket=self.bucket,
+                Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True},
+            )
+            self.n_deleted += len(chunk)
+        if self.n_deleted:
+            print(f"deleted {self.n_deleted:,} stale objects")
+
         bad = {k for k, _ in self.failed}
-        self.client.put_object(
-            Bucket=self.bucket, Key=MANIFEST_KEY,
-            Body=body({k: v for k, v in self.next_manifest.items() if k not in bad}),
-            ContentType="application/json",
-        )
+        manifest_body = body({k: v for k, v in self.next_manifest.items() if k not in bad})
+        # The manifest is the dedup state for ~700k objects; give it the same
+        # persistence the data got.
+        for attempt in range(5):
+            if self._put_one((MANIFEST_KEY, manifest_body)) is None:
+                break
+        else:
+            print("WARNING: manifest write failed after retries. Next run will "
+                  "see stale dedup state; re-run with --resume if interrupted.")
         if self.failed:
             print(f"WARNING: {len(self.failed):,} objects still failed. "
                   f"Re-run with --resume to pick them up.")
@@ -228,14 +272,63 @@ def stream(conn, sql: str, name: str, size: int = 10_000):
     cur.close()
 
 
+def tiered_buckets(entries, sort_key, cap=SEARCH_CAP, max_depth=MAX_PREFIX_DEPTH):
+    """entries: list of (norm_name, payload). Returns {prefix: [payload,...]}
+    with base tiers at depth 2-3 and deeper tiers emitted only where a bucket
+    overflows the cap — so the Worker's longest-prefix-first probe always
+    lands on a bucket that actually discriminates. Without this, 59% of
+    employers (everything ranked >cap in its 3-char bucket) were unreachable
+    through search."""
+    buckets: dict[str, list] = defaultdict(list)
+    for nm, payload in entries:
+        for pref in prefixes(nm):
+            buckets[pref].append((nm, payload))
+
+    for depth in range(3, max_depth):
+        for pref in [p for p, m in list(buckets.items()) if len(p) == depth and len(m) > cap]:
+            for nm, payload in buckets[pref]:
+                if len(nm) >= depth + 1:
+                    buckets[nm[: depth + 1]].append((nm, payload))
+
+    return {
+        pref: [payload for _, payload in sorted(members, key=lambda e: sort_key(e[1]))]
+        for pref, members in buckets.items()
+    }
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--limit", type=int, default=0, metavar="N")
+    ap.add_argument("--include-prefix", action="append", default=[], metavar="P",
+                    help="publish only keys under these prefixes; deferred "
+                         "changed keys keep their old manifest digest")
+    args = ap.parse_args()
+    if args.dry_run and args.resume:
+        ap.error("--dry-run never contacts R2, so --resume has no effect with it")
+    return args
+
+
+REQUIRED_PG = ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD"]
+REQUIRED_R2 = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
+
+
+def require_env(names):
+    missing = [n for n in names if not os.environ.get(n)]
+    if missing:
+        print(f"missing in .env: {', '.join(missing)} (copy .env.example and fill in)",
+              file=sys.stderr)
+        sys.exit(2)
+
+
 def main() -> int:
     load_dotenv(ROOT / ".env")
-    dry = "--dry-run" in sys.argv
-    force = "--force" in sys.argv
-    resume = "--resume" in sys.argv
-    limit = 0
-    if "--limit" in sys.argv:
-        limit = int(sys.argv[sys.argv.index("--limit") + 1])
+    args = parse_args()
+    require_env(REQUIRED_PG)
+    if not args.dry_run:
+        require_env(REQUIRED_R2)
 
     conn = psycopg2.connect(
         host=os.environ["POSTGRES_HOST"],
@@ -244,13 +337,26 @@ def main() -> int:
         password=os.environ["POSTGRES_PASSWORD"],
         dbname=os.environ.get("SOURCE_DB", "lca"),
     )
+    with conn.cursor() as c0:
+        # The export ORDER BYs sort multi-million-row sets; default work_mem
+        # spills them to disk.
+        c0.execute("SET work_mem = '512MB'")
 
-    p = Publisher(dry, force, resume, limit)
+    p = Publisher(args.dry_run, args.force, args.resume, args.limit,
+                  tuple(args.include_prefix))
     p.connect_r2()
+
+    # Which employers have jobs/titles subresources (the profile advertises
+    # this so clients can tell "GC-only employer" apart from a bad id).
+    with conn.cursor() as c1:
+        c1.execute("SELECT DISTINCT employer_id FROM sponsors.jobs")
+        has_jobs = {r[0] for r in c1.fetchall()}
+        c1.execute("SELECT DISTINCT employer_id FROM sponsors.job_titles")
+        has_titles = {r[0] for r in c1.fetchall()}
 
     # ── employer profiles ────────────────────────────────────────────────
     print("employers + profiles ...", flush=True)
-    search_buckets: dict[str, list] = defaultdict(list)
+    search_entries: list[tuple[str, tuple]] = []
     counts = {}
 
     sql = """
@@ -283,15 +389,15 @@ def main() -> int:
                 "pwd": n_pwd, "perm": n_perm,
                 "by_year": gc_year or [], "by_soc": gc_soc or {},
             },
-            "wage_vs_prevailing": float(wvp) if wvp is not None else None,
+            "wage_vs_prevailing": to_num(wvp),
+            "has_jobs": eid in has_jobs,
+            "has_titles": eid in has_titles,
             "filings_by_soc_year": soc_year or {},
             "trend": trend or [],
             "level_mix": level_mix or {},
             "red_flags": red_flags or {},
         }))
-
-        for pref in prefixes(name):
-            search_buckets[pref].append((n_lca or 0, key, ein, name))
+        search_entries.append((norm_name(name), (n_lca or 0, key, ein, name)))
 
     # ── per-employer jobs / titles ───────────────────────────────────────
     print("employer jobs ...", flush=True)
@@ -299,36 +405,35 @@ def main() -> int:
       SELECT e.key, j.year, j.soc_code, j.level, j.avg_wage, j.min_wage,
              j.max_wage, j.avg_prev_wage, j.state, j.county, j.zip, j.n_filings
       FROM sponsors.jobs j JOIN sponsors.employers e ON e.id = j.employer_id
-      ORDER BY e.key, j.year DESC, j.soc_code
+      ORDER BY e.key, j.year DESC, j.soc_code, j.level NULLS LAST,
+               j.state NULLS LAST, j.county NULLS LAST, j.zip NULLS LAST
     """
     for key, rows in groupby(stream(conn, sql, "jobs"), key=lambda r: r[0]):
         p.put(f"e/{key}/jobs.json", body({"id": key, "jobs": [
             {"year": y, "soc_code": s, "level": lv,
-             "avg_offered_wage": aw, "min_wage": mn, "max_wage": mx,
-             "avg_prevailing_wage": pw, "state": st, "county": co,
-             "zip": z, "n_filings": n}
+             "avg_offered_wage": to_num(aw), "min_wage": to_num(mn),
+             "max_wage": to_num(mx), "avg_prevailing_wage": to_num(pw),
+             "state": st, "county": co, "zip": z, "n_filings": n}
             for _, y, s, lv, aw, mn, mx, pw, st, co, z, n in rows
         ]}))
 
     print("employer titles ...", flush=True)
-    title_buckets: dict[str, dict] = defaultdict(dict)
+    title_entries: dict[tuple[str, str], dict] = {}
     sql = """
       SELECT e.key, t.soc_code, t.title, t.n_filings, t.avg_wage,
              t.min_wage, t.max_wage, t.level_mix
       FROM sponsors.job_titles t JOIN sponsors.employers e ON e.id = t.employer_id
-      ORDER BY e.key, t.n_filings DESC
+      ORDER BY e.key, t.n_filings DESC, t.soc_code, t.title
     """
     for key, rows in groupby(stream(conn, sql, "titles"), key=lambda r: r[0]):
         items = []
         for _, soc, title, n, aw, mn, mx, mix in rows:
             items.append({"soc_code": soc, "title": title, "n_filings": n,
-                          "avg_wage": aw, "min_wage": mn, "max_wage": mx,
-                          "level_mix": mix or {}})
-            # title -> soc lookup corpus for career-ops
-            for pref in prefixes(title):
-                b = title_buckets[pref].setdefault((norm_name(title), soc),
-                                                   {"title": title, "soc_code": soc, "n": 0})
-                b["n"] += n or 0
+                          "avg_wage": to_num(aw), "min_wage": to_num(mn),
+                          "max_wage": to_num(mx), "level_mix": mix or {}})
+            nm = norm_name(title)
+            b = title_entries.setdefault((nm, soc), {"title": title, "soc_code": soc, "n": 0})
+            b["n"] += n or 0
         p.put(f"e/{key}/titles.json", body({"id": key, "titles": items}))
 
     # ── wage benchmarks, one object per (soc, level) ─────────────────────
@@ -337,7 +442,8 @@ def main() -> int:
       SELECT soc_code, level, scope, state, zip, year, n_filings,
              employer_count, p25, p50, p75, mean, min_wage, max_wage
       FROM sponsors.wage_benchmarks
-      ORDER BY soc_code, level, scope, state, zip, year
+      ORDER BY soc_code, level NULLS LAST, scope, state NULLS LAST,
+               zip NULLS LAST, year
     """
     for (soc, level), rows in groupby(stream(conn, sql, "bench"),
                                       key=lambda r: (r[0], r[1])):
@@ -345,8 +451,8 @@ def main() -> int:
                "national": [], "states": defaultdict(list), "zips": defaultdict(list)}
         for _, _, scope, state, zipc, year, n, ec, p25, p50, p75, mean, mn, mx in rows:
             stat = {"year": year, "n_filings": n, "employer_count": ec,
-                    "p25": p25, "p50": p50, "p75": p75, "mean": mean,
-                    "min_wage": mn, "max_wage": mx}
+                    "p25": to_num(p25), "p50": to_num(p50), "p75": to_num(p75),
+                    "mean": to_num(mean), "min_wage": to_num(mn), "max_wage": to_num(mx)}
             if scope == "national":
                 doc["national"].append(stat)
             elif scope == "state":
@@ -357,30 +463,32 @@ def main() -> int:
         doc["zips"] = dict(doc["zips"])
         p.put(f"w/{soc}/{level or 'NA'}.json", body(doc))
 
-    # ── prefix indexes ───────────────────────────────────────────────────
+    # ── search indexes (tiered) ──────────────────────────────────────────
     print("search indexes ...", flush=True)
-    for pref, hits in search_buckets.items():
-        hits.sort(key=lambda h: (-h[0], h[3]))
+    emp_tiers = tiered_buckets(search_entries, sort_key=lambda h: (-h[0], h[3], h[1]))
+    for pref in sorted(emp_tiers):
+        hits = emp_tiers[pref]
         p.put(f"s/{pref}.json", body({
             "prefix": pref, "total": len(hits),
             "results": [{"id": k, "ein": e, "name": nm, "n_filings": n}
                         for n, k, e, nm in hits[:SEARCH_CAP]],
         }))
 
-    for pref, bucket in title_buckets.items():
-        items = sorted(bucket.values(), key=lambda b: -b["n"])
+    title_list = [(nm, b) for (nm, _soc), b in title_entries.items()]
+    title_tiers = tiered_buckets(title_list, sort_key=lambda b: (-b["n"], b["soc_code"], b["title"]))
+    for pref in sorted(title_tiers):
+        items = title_tiers[pref]
         p.put(f"t/{pref}.json", body({
             "prefix": pref, "total": len(items), "results": items[:SEARCH_CAP],
         }))
 
-    # ── meta (this is what /healthz serves) ──────────────────────────────
-    cur = conn.cursor()
-    for t in ("employers", "jobs", "gc_filings", "job_titles", "wage_benchmarks"):
-        cur.execute(f"SELECT COUNT(*) FROM sponsors.{t}")
-        counts[t] = cur.fetchone()[0]
-    cur.execute("SELECT now()")
-    built = cur.fetchone()[0]
-    cur.close()
+    # ── meta (served by /healthz) ────────────────────────────────────────
+    with conn.cursor() as cur:
+        for t in ("employers", "jobs", "gc_filings", "job_titles", "wage_benchmarks"):
+            cur.execute(f"SELECT COUNT(*) FROM sponsors.{t}")
+            counts[t] = cur.fetchone()[0]
+        cur.execute("SELECT now()")
+        built = cur.fetchone()[0].isoformat()
     p.put("meta.json", body({"ok": True, "rows": counts, "built_at": built,
                              "objects": p.n_objects + 1}))
 
@@ -389,10 +497,15 @@ def main() -> int:
 
     mb = p.n_bytes / (1024 * 1024)
     print(f"\nobjects: {p.n_objects:,}   total: {mb:,.1f} MB")
-    if dry:
+    if args.dry_run:
         print("dry run — nothing uploaded.")
-        print(f"a full publish would use ~{p.n_objects:,} of 1,000,000 monthly "
-              f"Class A operations.")
+        if args.limit:
+            print(f"(--limit {args.limit}: counts cover only the first "
+                  f"{args.limit} objects, not a full publish)")
+        else:
+            print(f"a full publish would use ~{p.n_objects:,} of 1,000,000 "
+                  f"monthly Class A operations, minus unchanged objects "
+                  f"skipped by the manifest diff.")
     else:
         print(f"uploaded (changed only): {p.n_uploaded:,}")
     return 0

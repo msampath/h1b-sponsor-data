@@ -5,6 +5,7 @@ then reports row counts and runs the verification gates from the plan.
 
 Usage:
     python etl/build.py
+    python etl/build.py --verify-only   # re-run the gates without rebuilding
 
 Config comes from .env (see .env.example). Reads and writes `lca` only —
 the raw public.* tables are never modified.
@@ -23,6 +24,8 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 SQL = ROOT / "sql"
 
+# 02_raw_schema.sql is reference DDL for the RAW tables (docs/DATA.md); the
+# raw load is a one-time manual step, so build.py never executes it.
 STEPS = ["00_functions.sql", "01_schema.sql", "03_populate.sql"]
 
 # Ranges are wide on purpose: they exist to catch a normalizer collapsing or

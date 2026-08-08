@@ -20,6 +20,13 @@ API key: email `sms@surakshith.com`
 | `GET /wages?soc=15-1252&level=II` | wage percentiles nationally, by state, by ZIP |
 | `GET /titles?q=` | title to SOC lookup corpus |
 
+The profile carries `has_jobs` and `has_titles` booleans: the 42% of employers
+with green-card filings but no LCA rows have no `/jobs` or `/titles`
+subresource, and these flags tell that apart from a bad id. `level` on `/wages`
+accepts `I`, `II`, `III`, `IV`, or `NA` (filings whose wage level DOL left
+blank or unparseable). A presented API key that is not recognized returns 401,
+not a silent drop to the anonymous tier.
+
 `:id` is the FEIN (`941156497` or `94-1156497`) where DOL published one.
 Employers that appear only in FY2020 to FY2023 have no FEIN in the source
 files, so they get an opaque key (`n-3f9a1c2d4e5b6789`). Search returns both
@@ -58,9 +65,11 @@ third party client site.
 - Keyed: 200 requests/hour, bucketed by key
 - Every response carries `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and
   `X-RateLimit-Reset`. A 429 adds `Retry-After`.
-- Going over costs a 60 second cool off. Requests made during a cool off
-  escalate it to 15 minutes, then an hour. Respect `Retry-After` and you never
-  escalate.
+- Going over the limit returns 429 with a `Retry-After` set to exactly the
+  time until one token refills. Respect it and you are never re-denied. There
+  is no escalation: the bucket is the whole protection, so a client that
+  ignores `Retry-After` gains nothing and a shared NAT is never punished for
+  the traffic of one bad co-tenant.
 
 ## Architecture
 
@@ -101,20 +110,30 @@ budget alert on the account.
 npm install
 npx wrangler login
 npx wrangler r2 bucket create h1b-sponsor-data
-npm run dev
+npm run dev --remote   # local dev needs --remote: the bucket lives in R2,
+                       # a local wrangler dev sees an empty simulated one
+npm test               # 45 vitest + 20 pytest (via `python -m pytest`)
 ```
 
 ## Data pipeline
 
 Needs a local Postgres holding `lca_disclosure`, `pwd_disclosure`, and
-`perm_disclosure`. Config in `.env` (see `.env.example`).
+`perm_disclosure`. See [docs/DATA.md](docs/DATA.md) for where those come from
+and how to load them; `sql/02_raw_schema.sql` is the raw DDL. Config in `.env`
+(see `.env.example`).
 
 ```bash
 python -m pip install -r etl/requirements.txt
-python etl/build.py              # raw to sponsors schema, runs verification gates
-python etl/publish.py --dry-run  # object count and bytes, uploads nothing
-python etl/publish.py            # uploads changed objects only
+python etl/build.py               # raw to sponsors schema, runs verification gates
+python etl/build.py --verify-only # re-run the gates without rebuilding
+python etl/publish.py --dry-run   # object count and bytes, uploads nothing
+python etl/publish.py             # uploads changed objects only (manifest diff)
 ```
+
+`publish.py` also takes `--resume` (after an interrupted run, lists the bucket
+and skips what landed), `--limit N` (exercise the real upload path on N
+objects, never writing the manifest), and `--include-prefix P` (publish only
+keys under a prefix, e.g. just the `s/` search tiers).
 
 `build.py` fails if a row count drifts outside its measured range or a gate
 breaks. The normalizers are the fragile part and a regression there is hard to

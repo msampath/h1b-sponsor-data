@@ -82,8 +82,11 @@ SELECT
   sponsors.norm_level(pw_wage_level)                                  AS level,
   nullif(btrim(job_title), '')                                        AS title,
   worksite_state                                                      AS state,
-  worksite_county                                                     AS county,
-  worksite_postal_code                                                AS zip,
+  -- county arrives in mixed case (488 variant collisions measured) and
+  -- postal_code carries ZIP+4 and junk (203,121 non-5-digit values);
+  -- both are GROUP BY keys, so normalize here or the grain fragments.
+  nullif(upper(btrim(worksite_county)), '')                           AS county,
+  substring(worksite_postal_code FROM '^([0-9]{5})')                  AS zip,
   case_status                                                         AS status,
   -- wage columns are NULL unless the filing is quoted annually
   CASE WHEN wage_unit_of_pay = 'Year' THEN wage_rate_of_pay_from END  AS wage_from,
@@ -186,10 +189,19 @@ TRUNCATE sponsors.wage_benchmarks, sponsors.job_titles, sponsors.gc_filings,
          RESTART IDENTITY CASCADE;
 
 INSERT INTO sponsors.employers (key, ein, name)
-SELECT DISTINCT ON (ekey) ekey, ein, name
+SELECT DISTINCT ON (ekey) ekey,
+       -- (67) an employer keyed by FEIN can still surface a most-recent row
+       -- whose own ein column was NULL; the key IS the FEIN, so backfill it.
+       COALESCE(ein, CASE WHEN ekey ~ '^[0-9]{9}$' THEN ekey END) AS ein,
+       name
 FROM emp_src
+-- belt-and-braces: norm_name(...) IS NOT NULL in every emp_src arm already
+-- implies a non-empty name; kept as an invariant guard, not a filter.
 WHERE name IS NOT NULL AND name <> ''
-ORDER BY ekey, d DESC NULLS LAST;
+-- name/ein tie-break: two sources can file the same employer on the same
+-- date; without a total order the chosen spelling flips per rebuild and
+-- churns every derived object's sha256.
+ORDER BY ekey, d DESC NULLS LAST, name, ein NULLS LAST;
 
 -- jobs: annual-wage filings only (see header note)
 INSERT INTO sponsors.jobs (employer_id, year, soc_code, level, avg_wage,
@@ -310,7 +322,8 @@ lvl AS (
 trend AS (
   SELECT id, jsonb_agg(jsonb_build_object(
            'year', year, 'filings', f, 'new', nw, 'transfer', tr,
-           'continued', ct, 'certified', ce, 'denied', dn, 'withdrawn', wd
+           'continued', ct, 'certified', ce, 'denied', dn, 'withdrawn', wd,
+           'certified_withdrawn', cw
          ) ORDER BY year) AS j
   FROM (
     SELECT id, year, COUNT(*) AS f,
@@ -319,7 +332,8 @@ trend AS (
            COALESCE(SUM(cont_emp), 0) AS ct,
            COUNT(*) FILTER (WHERE status = 'Certified') AS ce,
            COUNT(*) FILTER (WHERE status = 'Denied') AS dn,
-           COUNT(*) FILTER (WHERE status LIKE '%Withdrawn') AS wd
+           COUNT(*) FILTER (WHERE status = 'Withdrawn') AS wd,
+           COUNT(*) FILTER (WHERE status = 'Certified - Withdrawn') AS cw
     FROM base GROUP BY id, year
   ) t GROUP BY id
 ),
@@ -401,6 +415,14 @@ COMMIT;
 -- ── indexes ──────────────────────────────────────────────────────────────
 -- Built after the load; maintaining them during bulk INSERT costs more than
 -- one rebuild at the end.
+DROP INDEX IF EXISTS sponsors.jobs_by_employer;
+DROP INDEX IF EXISTS sponsors.gc_by_employer;
+DROP INDEX IF EXISTS sponsors.gc_by_emp_soc;
+DROP INDEX IF EXISTS sponsors.titles_by_employer;
+DROP INDEX IF EXISTS sponsors.titles_by_title;
+DROP INDEX IF EXISTS sponsors.bench_lookup;
+DROP INDEX IF EXISTS sponsors.employers_name;
+DROP INDEX IF EXISTS sponsors.employers_ein;
 CREATE INDEX jobs_by_employer   ON sponsors.jobs (employer_id);
 CREATE INDEX gc_by_employer     ON sponsors.gc_filings (employer_id);
 CREATE INDEX gc_by_emp_soc      ON sponsors.gc_filings (employer_id, soc_code);

@@ -23,7 +23,9 @@ DROP TABLE IF EXISTS sponsors.employers;
 --   1. the FEIN, when the filing carries one
 --   2. else the FEIN this employer's name maps to in a FY2024+ filing
 --      (recovers 85.7% of the FEIN-less rows)
---   3. else a name-derived slug, `n-<name>-<hash>`
+--   3. else an opaque hash key, `n-<16 hex chars>` (never the name:
+--      many FEIN-less employers are sole proprietorships named after
+--      a person, and names do not belong in URLs or logs)
 -- `key` is what appears in API URLs. `ein` stays nullable and truthful.
 CREATE TABLE sponsors.employers (
   id    integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -65,7 +67,7 @@ CREATE TABLE sponsors.employer_profile (
   red_flags            jsonb   -- value + evidence counts per flag
 );
 
--- ~730-790k rows. Company-level wage detail.
+-- ~1.87M rows (see build.py EXPECTED for the gated range).
 CREATE TABLE sponsors.jobs (
   id            integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   employer_id   integer NOT NULL REFERENCES sponsors.employers(id),
@@ -82,7 +84,7 @@ CREATE TABLE sponsors.jobs (
   n_filings     integer NOT NULL
 );
 
--- 270,351 rows. Kept as a table (not just profile JSON) because Q3 asks
+-- ~760k rows (see build.py EXPECTED). Kept as a table (not just profile JSON) because Q3 asks
 -- per-SOC and the profile's gc_by_year is keyed by year.
 CREATE TABLE sponsors.gc_filings (
   id          integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -94,7 +96,7 @@ CREATE TABLE sponsors.gc_filings (
   n_approved  integer NOT NULL
 );
 
--- ~561k rows. What this employer calls the role, and what they pay for it.
+-- ~1.35M rows (see build.py EXPECTED). What this employer calls the role, and what they pay for it.
 CREATE TABLE sponsors.job_titles (
   id          integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   employer_id integer NOT NULL REFERENCES sponsors.employers(id),
