@@ -69,6 +69,53 @@ describe("routing and validation", () => {
     expect(res.status).toBe(401);
   });
 
+  it("Bearer parsing is case-insensitive per RFC 6750", async () => {
+    // Lowercase 'bearer' used to silently drop to anon and skip the 401,
+    // sidestepping the auth contract. Both known and unknown tokens must
+    // route the same regardless of case.
+    const unknown = await worker.fetch(
+      req("/employers/search?q=am", { headers: { authorization: "bearer wrong" } }),
+      env(),
+    );
+    expect(unknown.status).toBe(401);
+    const known = await worker.fetch(
+      req("/employers/search?q=am", { headers: { authorization: `bearer ${TOKEN}` } }),
+      env({
+        DATA: { get: async () => ({ httpEtag: '"x"', body: '{"prefix":"am"}' }) },
+      }),
+    );
+    expect(known.status).toBe(200);
+    expect(known.headers.get("x-ratelimit-limit")).toBe("30");
+  });
+
+  it("vary: origin is set on every response including 401/404/429/OPTIONS", async () => {
+    // Without vary, a shared cache serving public max-age=3600 could mix
+    // origin variants. Both Sonnet and Opus flagged the OPTIONS branch had
+    // been missed by the first pass; this pins all four status classes.
+    const cases: Array<{ path: string; init: RequestInit; wantStatus: number }> = [
+      { path: "/healthz", init: {}, wantStatus: 200 },
+      { path: "/healthz", init: { method: "OPTIONS" }, wantStatus: 204 },
+      { path: "/employers/search?q=am", init: { headers: { authorization: "Bearer nope" } }, wantStatus: 401 },
+      { path: "/nope", init: {}, wantStatus: 404 },
+    ];
+    for (const c of cases) {
+      for (const origin of ["https://surakshith.com", "https://evil.example", undefined]) {
+        const baseHeaders = (c.init.headers ?? {}) as Record<string, string>;
+        const headers = { ...baseHeaders, ...(origin ? { origin } : {}) };
+        const res = await worker.fetch(req(c.path, { ...c.init, headers }), env());
+        expect(res.status).toBe(c.wantStatus);
+        expect(res.headers.get("vary")?.toLowerCase()).toContain("origin");
+      }
+    }
+  });
+
+  it("healthz never carries rate-limit headers (served pre-meter)", async () => {
+    const res = await worker.fetch(req("/healthz"), env());
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-ratelimit-limit")).toBeNull();
+    expect(res.headers.get("x-ratelimit-remaining")).toBeNull();
+  });
+
   it("validates wages params and accepts level=NA", async () => {
     expect((await worker.fetch(req("/wages?soc=bad&level=II"), env())).status).toBe(400);
     expect((await worker.fetch(req("/wages?soc=15-1252&level=V"), env())).status).toBe(400);
@@ -123,6 +170,71 @@ describe("routing and validation", () => {
     expect(res.headers.get("x-ratelimit-limit")).toBeNull(); // no fabricated headers
     expect(spy).toHaveBeenCalled();
     spy.mockRestore();
+  });
+
+  it("fails open on non-ok DO reply (500), same shape as the throw path", async () => {
+    // The res.ok=false branch backstops any protocol error the DO can emit
+    // (unknown tier, bad JSON) without taking the API down.
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const e = env({
+      DATA: { get: async () => ({ httpEtag: '"x"', body: "{}" }) },
+      BUCKET: {
+        idFromName: () => ({}),
+        get: () => ({ fetch: async () => new Response("unknown tier", { status: 500 }) }),
+      },
+    });
+    const res = await worker.fetch(req("/employers/770493581"), e);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-ratelimit-limit")).toBeNull();
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("serves /employers/:id/jobs and /titles subroutes", async () => {
+    const seen: string[] = [];
+    const e = env({
+      DATA: {
+        get: async (key: string) => {
+          seen.push(key);
+          return { httpEtag: '"x"', body: "{}" };
+        },
+      },
+    });
+    await worker.fetch(req("/employers/770493581/jobs"), e);
+    await worker.fetch(req("/employers/770493581/titles"), e);
+    expect(seen).toEqual(["e/770493581/jobs.json", "e/770493581/titles.json"]);
+  });
+
+  it("returns 412 (not 304) when If-Match precondition fails", async () => {
+    const e = env({
+      DATA: {
+        get: async (_: string, opts?: { onlyIf?: Headers }) => {
+          if (opts?.onlyIf?.get("if-match")) return { httpEtag: '"m"' }; // body-less
+          return { httpEtag: '"m"', body: "{}" };
+        },
+      },
+    });
+    const res = await worker.fetch(
+      req("/healthz", { headers: { "if-match": '"stale"' } }),
+      e,
+    );
+    expect(res.status).toBe(412);
+  });
+
+  it("returns 304 for a successful If-None-Match revalidation", async () => {
+    const e = env({
+      DATA: {
+        get: async (_: string, opts?: { onlyIf?: Headers }) => {
+          if (opts?.onlyIf?.get("if-none-match") === '"m"') return { httpEtag: '"m"' };
+          return { httpEtag: '"m"', body: "{}" };
+        },
+      },
+    });
+    const res = await worker.fetch(
+      req("/healthz", { headers: { "if-none-match": '"m"' } }),
+      e,
+    );
+    expect(res.status).toBe(304);
   });
 });
 

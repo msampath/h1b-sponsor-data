@@ -16,16 +16,19 @@ const HOUR_MS = 3600 * 1000;
 export const LIMITS = { anon: 30, keyed: 200 } as const;
 export type Tier = keyof typeof LIMITS;
 
-// During a lockout, persist at most one state write per this window. The
-// reply does not depend on the write; this only bounds DO storage ops when
-// a client retries in a tight loop.
-const NOTE_WINDOW_MS = 30_000;
+/** Reply shape shared with worker/index.ts so producer and consumer stay pinned. */
+export interface RateVerdict {
+  ok: boolean;
+  limit: number;
+  remaining: number;
+  resetAt: number;
+  retryAfter: number;
+}
 
 interface BucketState {
   tokens: number;
   refilledAt: number;
   lockoutUntil: number;
-  lastNoteAt: number;
 }
 
 export class BucketMeter {
@@ -40,9 +43,11 @@ export class BucketMeter {
       return new Response("not found", { status: 404 });
     }
     const { tier } = (await request.json()) as { tier: Tier };
-    if (!(tier in LIMITS)) {
-      // Programmer error in the caller, not client traffic. Fail loud; the
-      // Worker's try/catch treats a non-JSON/non-200 DO reply as fail-open.
+    // Object.hasOwn — `tier in LIMITS` was prototype-chain bypassable, so
+    // a crafted tier like "toString" reached the state math and produced
+    // NaN tokens, which then passed `tokens < 1`. Caller-unreachable from
+    // this Worker's own dispatch, but the guard should still be tight.
+    if (!Object.hasOwn(LIMITS, tier)) {
       return new Response("unknown tier", { status: 500 });
     }
     const limit = LIMITS[tier];
@@ -50,10 +55,9 @@ export class BucketMeter {
     const s = await this.load(limit, now);
 
     if (s.lockoutUntil > now) {
-      if (now - s.lastNoteAt > NOTE_WINDOW_MS) {
-        s.lastNoteAt = now;
-        await this.save(s);
-      }
+      // Nothing to persist during a lockout: `tokens`, `refilledAt` and
+      // `lockoutUntil` are all unchanged from when the lockout was set, so
+      // reply and go — one storage write saved per throttled request.
       return this.reply(s, limit, now, false);
     }
 
@@ -69,7 +73,6 @@ export class BucketMeter {
       // Advertising less (a fixed 60s did) re-denies a compliant client
       // that returns exactly at Retry-After.
       s.lockoutUntil = now + Math.ceil(((1 - s.tokens) * HOUR_MS) / limit);
-      s.lastNoteAt = now;
       await this.save(s);
       return this.reply(s, limit, now, false);
     }
@@ -82,7 +85,7 @@ export class BucketMeter {
   async load(limit: number, now: number): Promise<BucketState> {
     const raw = await this.state.storage.get<BucketState>("s");
     if (!raw) {
-      return { tokens: limit, refilledAt: now, lockoutUntil: 0, lastNoteAt: 0 };
+      return { tokens: limit, refilledAt: now, lockoutUntil: 0 };
     }
     // A redeploy may lower a tier's limit; clamp so old state can't exceed it.
     raw.tokens = Math.min(raw.tokens, limit);
@@ -95,12 +98,13 @@ export class BucketMeter {
 
   reply(s: BucketState, limit: number, now: number, ok: boolean): Response {
     const retryMs = Math.max(0, s.lockoutUntil - now);
-    return Response.json({
+    const verdict: RateVerdict = {
       ok,
       limit,
       remaining: Math.max(0, Math.floor(s.tokens)),
       resetAt: Math.floor((ok ? now + HOUR_MS / limit : s.lockoutUntil) / 1000),
       retryAfter: Math.ceil(retryMs / 1000),
-    });
+    };
+    return Response.json(verdict);
   }
 }

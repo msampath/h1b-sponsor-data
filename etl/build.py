@@ -45,8 +45,20 @@ EXPECTED = {
 MIN_YEARS = 6
 
 
+def _require_env(names):
+    """Same shape as publish.py's require_env: fail on a missing key with a
+    helpful message instead of a raw KeyError. Duplicated rather than
+    imported to keep the ETL scripts independent of each other."""
+    missing = [n for n in names if not os.environ.get(n)]
+    if missing:
+        print(f"missing in .env: {', '.join(missing)} (copy .env.example and fill in)",
+              file=sys.stderr)
+        sys.exit(2)
+
+
 def main() -> int:
     load_dotenv(ROOT / ".env")
+    _require_env(["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD"])
     dsn = dict(
         host=os.environ["POSTGRES_HOST"],
         port=int(os.environ.get("POSTGRES_PORT", "5432")),
@@ -54,9 +66,6 @@ def main() -> int:
         password=os.environ["POSTGRES_PASSWORD"],
         dbname=os.environ.get("SOURCE_DB", "lca"),
     )
-    if not dsn["password"]:
-        print("POSTGRES_PASSWORD is empty — fill in .env first.", file=sys.stderr)
-        return 2
 
     print(f"connecting to {dsn['user']}@{dsn['host']}:{dsn['port']}/{dsn['dbname']}")
     db = psycopg2.connect(**dsn)
@@ -130,6 +139,19 @@ def main() -> int:
     print(f"  jobs year coverage              {lo}-{hi} ({n_years} distinct)")
     if n_years < MIN_YEARS:
         failures.append(f"jobs spans only {n_years} years — identity resolution suspect")
+
+    # Every employer must have a first/last year: the GC-only cohort (~70k)
+    # previously got NULLs because the year aggregate read LCA rows only.
+    # A regression on the gc_years CTE surfaces here.
+    cur.execute("""
+        SELECT COUNT(*) FROM sponsors.employer_profile
+        WHERE first_year IS NULL OR last_year IS NULL
+    """)
+    n_null_years = cur.fetchone()[0]
+    print(f"  profiles missing first/last     {n_null_years:,}")
+    if n_null_years:
+        failures.append(f"{n_null_years:,} profiles with NULL first_year/last_year "
+                        f"— GC-year merge suspect")
 
     cur.execute("""
         SELECT COUNT(*) FILTER (WHERE ein IS NOT NULL),

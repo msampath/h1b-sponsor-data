@@ -55,8 +55,14 @@ _JS_WS = re.compile(
 def norm_name(s: str) -> str:
     """Must match worker/r2.ts searchPrefix() exactly, or a query lands on a
     bucket that was never generated and 404s. Parity is pinned by test
-    vectors duplicated in tests/worker/r2.test.ts and tests/etl."""
-    out = _JS_WS.sub(" ", (s or "").strip().lower())
+    vectors duplicated in tests/worker/r2.test.ts and tests/etl.
+
+    Order matters: collapse JS-\\s runs FIRST, then strip leading/trailing
+    spaces. Python's str.strip() misses codepoints JS trim() strips (leading
+    U+FEFF is the case that bit us), but once the whitespace class is
+    collapsed to ASCII spaces, a plain .strip() aligns with the JS side.
+    """
+    out = _JS_WS.sub(" ", (s or "").lower()).strip(" ")
     return "".join(ch for ch in out if ch in _KEEP)
 
 
@@ -230,6 +236,22 @@ class Publisher:
             print("limit run: manifest not written")
             return
 
+        # Under --include-prefix, keys outside the filter that ALSO dropped
+        # out of the DB are not reached by put() at all. Carry their old
+        # digests forward so the next unfiltered publish still sees them in
+        # `stale` and deletes them; otherwise an --include-prefix run
+        # silently orphans them (super-review-retest-report.md).
+        n_carried = 0
+        if self.include and self.manifest:
+            for k, v in self.manifest.items():
+                if k in self.next_manifest:
+                    continue
+                if not any(k.startswith(pre) for pre in self.include):
+                    self.next_manifest[k] = v  # carry forward, not for delete
+                    n_carried += 1
+        if n_carried:
+            print(f"carried forward {n_carried:,} deferred digests outside {self.include}")
+
         # Delete keys that existed in the previous manifest but were not
         # produced this run (identity churn between rebuilds would otherwise
         # leave stale employer objects served forever). DeleteObject is a
@@ -237,20 +259,51 @@ class Publisher:
         # under --force/--resume-from-nothing there is no old set to diff.
         stale = sorted(set(self.manifest) - set(self.next_manifest))
         if self.include:
-            # only reason about prefixes this run actually produced
+            # only reason about prefixes this run actually produced; the
+            # carry-forward above keeps out-of-scope keys out of `stale`.
             stale = [k for k in stale if any(k.startswith(pre) for pre in self.include)]
+        undeletable: list[str] = []
         for i in range(0, len(stale), 1000):
             chunk = stale[i : i + 1000]
-            self.client.delete_objects(
+            resp = self.client.delete_objects(
                 Bucket=self.bucket,
-                Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True},
+                Delete={"Objects": [{"Key": k} for k in chunk]},  # Quiet=False
             )
-            self.n_deleted += len(chunk)
+            errs = resp.get("Errors", []) or []
+            failed_keys = {e["Key"] for e in errs}
+            self.n_deleted += len(chunk) - len(failed_keys)
+            # Retry each failed key once; delete_objects with a single-item
+            # list is cheap and separates the transient-503 case from the
+            # permanent-error case.
+            for e in errs:
+                r2 = self.client.delete_objects(
+                    Bucket=self.bucket,
+                    Delete={"Objects": [{"Key": e["Key"]}]},
+                )
+                if not (r2.get("Errors") or []):
+                    self.n_deleted += 1
+                    failed_keys.discard(e["Key"])
+            undeletable.extend(sorted(failed_keys))
         if self.n_deleted:
             print(f"deleted {self.n_deleted:,} stale objects")
+        if undeletable:
+            # Keep their old digest so the next run's stale diff retries the
+            # delete; a discarded manifest entry would orphan them forever.
+            print(f"WARNING: {len(undeletable):,} deletions still failing "
+                  f"after retry; keeping their manifest entries so next run "
+                  f"retries. First few: {undeletable[:5]}")
+            for k in undeletable:
+                if k in self.manifest:
+                    self.next_manifest[k] = self.manifest[k]
 
+        # Failed uploads must be excluded from BOTH the written manifest AND
+        # self.next_manifest itself: main() reads len(self.next_manifest)
+        # for meta.json's object count, and that count has to match what's
+        # actually served. (Sonnet review #1.)
         bad = {k for k, _ in self.failed}
-        manifest_body = body({k: v for k, v in self.next_manifest.items() if k not in bad})
+        for k in bad:
+            self.next_manifest.pop(k, None)
+        manifest_body = body(self.next_manifest)
         # The manifest is the dedup state for ~700k objects; give it the same
         # persistence the data got.
         for attempt in range(5):
@@ -278,7 +331,14 @@ def tiered_buckets(entries, sort_key, cap=SEARCH_CAP, max_depth=MAX_PREFIX_DEPTH
     overflows the cap — so the Worker's longest-prefix-first probe always
     lands on a bucket that actually discriminates. Without this, 59% of
     employers (everything ranked >cap in its 3-char bucket) were unreachable
-    through search."""
+    through search.
+
+    Exact-name floor (validator A finding): a member whose full normalized
+    name equals its bucket's prefix cannot descend to a deeper tier because
+    deeper tiers only admit strictly longer names. So even typing the exact
+    full name would return the capped top-50 without them. Force those
+    members into the emitted head so an exact-name query always resolves.
+    """
     buckets: dict[str, list] = defaultdict(list)
     for nm, payload in entries:
         for pref in prefixes(nm):
@@ -290,10 +350,25 @@ def tiered_buckets(entries, sort_key, cap=SEARCH_CAP, max_depth=MAX_PREFIX_DEPTH
                 if len(nm) >= depth + 1:
                     buckets[nm[: depth + 1]].append((nm, payload))
 
-    return {
-        pref: [payload for _, payload in sorted(members, key=lambda e: sort_key(e[1]))]
-        for pref, members in buckets.items()
-    }
+    out: dict[str, list] = {}
+    for pref, members in buckets.items():
+        ranked = sorted(members, key=lambda e: sort_key(e[1]))
+        # Callers slice the returned list to `cap`. If an exact-name member
+        # ranks outside `cap`, promote it into the head so a full-name query
+        # always resolves. IMPORTANT: strip promoted entries from the tail
+        # too, or the emitted `results` array (and its `total`) contains the
+        # same payload twice. (Opus review: duplicate-in-tail.)
+        head, tail = ranked[:cap], ranked[cap:]
+        promoted = [e for e in tail if e[0] == pref]
+        if promoted:
+            keep = [e for e in head if e[0] == pref]      # already in head
+            fillers = [e for e in head if e[0] != pref]
+            room = cap - len(keep) - len(promoted)
+            head = keep + fillers[: max(0, room)] + promoted
+            head.sort(key=lambda e: sort_key(e[1]))
+            tail = [e for e in tail if e[0] != pref]      # no duplicates downstream
+        out[pref] = [payload for _, payload in head + tail]
+    return out
 
 
 def parse_args():
@@ -308,6 +383,24 @@ def parse_args():
     args = ap.parse_args()
     if args.dry_run and args.resume:
         ap.error("--dry-run never contacts R2, so --resume has no effect with it")
+    # These two only matter for real uploads — under --dry-run the manifest
+    # is never loaded or written, so neither combination can damage anything.
+    # Allowing --dry-run --force --include-prefix is deliberate: it's the
+    # safe way to preview a scoped force-publish before running it for real.
+    if not args.dry_run:
+        if args.force and args.include_prefix:
+            # --force skips the manifest load, so the include-branch cannot
+            # carry deferred digests forward. finish() would then write a
+            # manifest containing only the included prefixes and the next
+            # full publish would re-upload every other key.
+            ap.error("--force with --include-prefix would destroy the manifest's "
+                     "dedup state for deferred keys; run without --force")
+        if args.force and args.resume:
+            # --resume lists the bucket to seed self.existing, but the force
+            # branch in put() ignores self.existing entirely, so the listing
+            # is wasted Class A ops and every key uploads anyway.
+            ap.error("--force ignores existing bucket keys, making --resume "
+                     "a no-op that still costs Class A listing operations")
     return args
 
 
@@ -483,16 +576,30 @@ def main() -> int:
         }))
 
     # ── meta (served by /healthz) ────────────────────────────────────────
+    # meta.json ALWAYS emits regardless of --include-prefix; the include
+    # filter should never leave healthz reporting a partial state or stale
+    # against the last full publish. Object count is the manifest size so it
+    # tracks what's actually served, not this run's local counter.
     with conn.cursor() as cur:
         for t in ("employers", "jobs", "gc_filings", "job_titles", "wage_benchmarks"):
             cur.execute(f"SELECT COUNT(*) FROM sponsors.{t}")
             counts[t] = cur.fetchone()[0]
         cur.execute("SELECT now()")
         built = cur.fetchone()[0].isoformat()
-    p.put("meta.json", body({"ok": True, "rows": counts, "built_at": built,
-                             "objects": p.n_objects + 1}))
-
+    # Emit meta.json AFTER finish() so its object count reflects the final
+    # served state (carry-forwards, deletes, undeletable fallbacks all
+    # applied). The include filter is lifted so meta.json always goes
+    # through: an --include-prefix run must never leave healthz stale, and
+    # it must never report a partial-run count.
     p.finish()
+    _filter, p.include = p.include, ()
+    _force, p.force = p.force, True   # bypass manifest-dedup for meta itself
+    p.put("meta.json", body({"ok": True, "rows": counts, "built_at": built,
+                             "objects": len(p.next_manifest) + 1}))
+    p.flush()
+    # meta.json is not managed by the manifest diff (never deleted, always
+    # rewritten), so we don't need a second finish() pass here.
+    p.include, p.force = _filter, _force
     conn.close()
 
     mb = p.n_bytes / (1024 * 1024)

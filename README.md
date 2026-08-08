@@ -110,9 +110,9 @@ budget alert on the account.
 npm install
 npx wrangler login
 npx wrangler r2 bucket create h1b-sponsor-data
-npm run dev --remote   # local dev needs --remote: the bucket lives in R2,
-                       # a local wrangler dev sees an empty simulated one
-npm test               # 45 vitest + 20 pytest (via `python -m pytest`)
+npm run dev            # -> wrangler dev --remote (the local simulated R2 is
+                       # empty; --remote is baked into the script)
+npm test               # vitest + pytest (via `python -m pytest`)
 ```
 
 ## Data pipeline
@@ -231,7 +231,31 @@ npx wrangler secret put API_KEYS     # {"<sha256-of-token>": "career-ops"}
 ```
 
 Then attach `api.surakshith.com` under Workers, h1b-sponsor-data, Settings,
-Domains and Routes.
+Domains and Routes. (Or set `routes = [{ pattern = "api.<yours>", custom_domain
+= true }]` in wrangler.toml so a redeploy reasserts it.)
+
+## Self-hosting
+
+Two touch points to change if you fork this under a different domain:
+
+- `worker/index.ts`: `ALLOWED_ORIGINS` (the CORS allowlist for browsers
+  calling the API from your site's origin).
+- `wrangler.toml`: the `routes` block (the hostname the Worker is bound to).
+
+`api.surakshith.com` in the README and its own CORS entries are the owner's
+config; nothing else in the code knows about the specific hostname.
+
+## Search semantics
+
+`/employers/search?q=X` and `/titles?q=X` return `{prefix, total, results}`
+where `results` is capped at 50 by filing volume. A 404 means no employer has
+a name starting with the normalized query prefix. Deeper prefix tiers (up to
+10 characters) exist only where a shallower bucket overflowed; the Worker
+probes at most five (longest available, two shorter neighbors, depth 3,
+depth 2) so typeahead pays one to five sequential R2 reads. Search covers
+about 98% of
+the 335k employers through their top-50 bucket, and the remaining ~2% share
+an overcrowded prefix with many higher-volume employers.
 
 ## Non-goals
 

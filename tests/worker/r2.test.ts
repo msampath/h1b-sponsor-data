@@ -21,6 +21,11 @@ describe("searchPrefix", () => {
     ["A&B", "ab"],
     ["AB", "ab"],
     ["X", null],
+    ["\ufeffacme corp", "acme corp"], // leading BOM: JS trim() strips, must match
+    ["acme corp\ufeff", "acme corp"], // trailing BOM too
+    ["A\u00a0B", "a b"],              // NBSP is JS \s -> space
+    ["A\u0085B", "ab"],               // NEL is NOT JS \s -> stripped
+    ["A\u001cB", "ab"],               // FS is NOT JS \s -> stripped
     ["éé", null], // strips to empty
     ["O'Neill Inc", "oneill inc"],
   ];
@@ -36,9 +41,31 @@ describe("searchPrefix", () => {
 });
 
 describe("searchKeyCandidates", () => {
-  it("probes longest-first down to depth 2", () => {
-    expect(searchKeyCandidates("amazo", keys.employerSearch)).toEqual([
-      "s/amazo.json",
+  it("probes longest, -1, -2, depth 3, depth 2 (five max)", () => {
+    // The 4-probe ladder skipped depth 4 for a 6-char query: [6, 5, 3, 2]
+    // meant "amazee" couldn't reach s/amaz.json even when it existed.
+    // Third neighbor closes that (validator A retest, 2026-08-08).
+    expect(searchKeyCandidates("amazee", keys.employerSearch)).toEqual([
+      "s/amazee.json",
+      "s/amaze.json",
+      "s/amaz.json",
+      "s/ama.json",
+      "s/am.json",
+    ]);
+  });
+  it("dedupes when the longest available IS a shorter depth", () => {
+    // len=3 -> {3,2}; len=4 -> {4,3,2}; len=5 -> {5,4,3,2}
+    expect(searchKeyCandidates("ama", keys.employerSearch)).toEqual([
+      "s/ama.json",
+      "s/am.json",
+    ]);
+    expect(searchKeyCandidates("amaz", keys.employerSearch)).toEqual([
+      "s/amaz.json",
+      "s/ama.json",
+      "s/am.json",
+    ]);
+    expect(searchKeyCandidates("amazi", keys.employerSearch)).toEqual([
+      "s/amazi.json",
       "s/amaz.json",
       "s/ama.json",
       "s/am.json",

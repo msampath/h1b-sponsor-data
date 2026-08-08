@@ -4,13 +4,13 @@
   "description": "Rate-limited public API over six years of aggregated US DOL immigration disclosures (H-1B LCA, PWD, PERM). Cloudflare Workers + R2.",
   "license": "MIT",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --remote",
     "deploy": "wrangler deploy",
     "types": "wrangler types",
     "typecheck": "tsc --noEmit",
-    "build": "python etl/build.py",
     "test": "vitest run",
-    "etl:publish": "python etl/publish.py"
+    "etl:publish": "python etl/publish.py",
+    "etl:build": "python etl/build.py"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260801.1",

@@ -1,6 +1,6 @@
 name = "h1b-sponsor-data"
 main = "worker/index.ts"
-compatibility_date = "2025-08-01"
+compatibility_date = "2026-08-08"
 
 # Custom domain. custom_domain = true makes wrangler create the hostname and
 # its DNS record on deploy. It only touches api.surakshith.com; the apex A

@@ -23,7 +23,14 @@ export const keys = {
   titleSearch: (prefix: string) => `t/${prefix}.json`,
 };
 
-const SECURITY_HEADERS = { "x-content-type-options": "nosniff" } as const;
+// Applied to every response, including 404s / 401s / 429s / 304s. `vary`
+// belongs on all of them, not just the CORS-allowed branch: without it, a
+// cache serving a public max-age=3600 body could hand a cross-origin response
+// to a same-origin request, or vice versa.
+const SECURITY_HEADERS = {
+  "x-content-type-options": "nosniff",
+  vary: "origin",
+} as const;
 
 export function json(body: unknown, status: number, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -61,7 +68,12 @@ export async function serve(
     ...headers,
   };
   if (!("body" in obj) || obj.body === null) {
-    return new Response(null, { status: 304, headers: base });
+    // R2's onlyIf handles both If-None-Match (revalidation) and If-Match
+    // (write-guard). Per RFC 9110, a failed If-Match on GET is 412, not
+    // 304. If-None-Match failures stay 304 as before.
+    const ifMatch = request?.headers.get("if-match");
+    const status = ifMatch ? 412 : 304;
+    return new Response(null, { status, headers: base });
   }
   return new Response(obj.body as unknown as BodyInit, {
     headers: { "content-type": "application/json; charset=utf-8", ...base },
@@ -97,11 +109,27 @@ export function searchPrefix(q: string): string | null {
   return cleaned.slice(0, MAX_PREFIX_DEPTH);
 }
 
-/** Candidate search keys for a cleaned prefix, longest (most specific) first. */
+/** Candidate search keys for a cleaned prefix, longest (most specific) first.
+ * At most five probes: the longest available prefix plus its two shorter
+ * neighbors (to cover overflow chains a query overshoots — e.g. "amazee"
+ * when only "amaz" exists, or "amazing" when the chain stops at "amaz"),
+ * then the depth-3 base tier and depth-2. Publisher emits deeper tiers
+ * only where a shallower bucket overflowed, so an unbounded ladder
+ * previously paid up to 9 serial 404 reads (see super-review-retest-report.md).
+ * A residual gap remains for queries so long that the chain stops more
+ * than two depths above them; storing per-lineage depth pointers in the
+ * shallow buckets would close it fully.
+ */
 export function searchKeyCandidates(cleaned: string, build: (p: string) => string): string[] {
+  const longest = Math.min(cleaned.length, MAX_PREFIX_DEPTH);
+  const depths = [longest, longest - 1, longest - 2, 3, 2]
+    .filter((d) => d >= 2 && d <= cleaned.length)      // no slicing past the string
+    .sort((a, b) => b - a);                            // longest first
+  const seen = new Set<string>();
   const out: string[] = [];
-  for (let d = Math.min(cleaned.length, MAX_PREFIX_DEPTH); d >= 2; d--) {
-    out.push(build(cleaned.slice(0, d)));
+  for (const d of depths) {
+    const key = build(cleaned.slice(0, d));            // depths differ but slices can match
+    if (!seen.has(key)) { seen.add(key); out.push(key); }
   }
   return out;
 }

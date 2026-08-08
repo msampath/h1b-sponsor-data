@@ -26,6 +26,8 @@ spec.loader.exec_module(publish)
     ("A\u00a0B", "a b"),    # NBSP is JS whitespace -> space
     ("A\u0085B", "ab"),     # NEL is NOT JS whitespace -> stripped
     ("A\u001cB", "ab"),     # FS is NOT JS whitespace -> stripped
+    ("\ufeffacme corp", "acme corp"),   # leading BOM: JS trim() strips, must match
+    ("acme corp\ufeff", "acme corp"),   # trailing BOM too
     ("", ""),
 ])
 def test_norm_name_parity(raw, want):
@@ -69,12 +71,51 @@ def test_tiered_buckets_respect_max_depth():
     assert max(len(k) for k in tiers) == 4
 
 
+def test_tiered_buckets_exact_name_not_duplicated_in_tail():
+    """Opus review: promoting an exact-name from tail to head must strip it
+    from tail too, or the emitted payload list carries the same object at
+    two indexes (and `total` is inflated)."""
+    cap = 3
+    entries = [(f"abcxx{i}", (100 - i, f"k{i}")) for i in range(5)]
+    entries.append(("abc", (1, "kabc")))
+    tiers = publish.tiered_buckets(entries, sort_key=lambda p: (-p[0], p[1]), cap=cap)
+    payloads = tiers["abc"]
+    kabc_count = sum(1 for p in payloads if p[1] == "kabc")
+    assert kabc_count == 1, f"kabc appeared {kabc_count}x in the emitted bucket"
+    # And the exact-name IS in the head (cap slice), which is the whole point.
+    head_names = [p[1] for p in payloads[:cap]]
+    assert "kabc" in head_names
+
+
+def test_tiered_buckets_exact_name_always_reachable():
+    """A member whose name equals its bucket's prefix cannot descend to a
+    deeper tier (deeper tiers only admit strictly longer names). It must
+    appear inside the [:cap] slice of its own-prefix bucket, or typing the
+    exact full name returns the capped top-N without it."""
+    cap = 3
+    # Bucket "abc": five higher-volume names PLUS the short 3-char name
+    # itself with volume 1 — without the exact-name fix, "abc" would be
+    # slice-ranked below the top-3 and vanish from search.
+    entries = [(f"abcxx{i}", (100 - i, f"k{i}")) for i in range(5)]
+    entries.append(("abc", (1, "kabc")))
+    tiers = publish.tiered_buckets(entries, sort_key=lambda p: (-p[0], p[1]), cap=cap)
+    head = tiers["abc"][:cap]
+    assert ("kabc",) in [(t[1],) for t in head] or any(t[1] == "kabc" for t in head), \
+        "exact-name 'abc' fell outside the emitted head of bucket 'abc'"
+
+
 # ── Publisher accounting through a fake client ───────────────────────────
 class FakeClient:
-    def __init__(self, fail_keys=()):
+    def __init__(self, fail_keys=(), delete_fail_keys=(), delete_fail_max=None):
         self.objects = {}
         self.deleted = []
         self.fail_keys = set(fail_keys)
+        # delete_fail_keys returns an Errors entry (mirrors R2's 200-with-
+        # Errors behaviour); delete_fail_max, when set, caps how many times
+        # a given key fails so we can exercise the retry-succeeds path.
+        self.delete_fail_keys = set(delete_fail_keys)
+        self.delete_fail_max = delete_fail_max
+        self.delete_attempts: dict = {}
         self.put_calls = 0
 
     def put_object(self, Bucket, Key, Body, ContentType):
@@ -84,7 +125,19 @@ class FakeClient:
         self.objects[Key] = Body
 
     def delete_objects(self, Bucket, Delete):
-        self.deleted += [o["Key"] for o in Delete["Objects"]]
+        errors = []
+        for o in Delete["Objects"]:
+            k = o["Key"]
+            n = self.delete_attempts.get(k, 0) + 1
+            self.delete_attempts[k] = n
+            if k in self.delete_fail_keys and (
+                self.delete_fail_max is None or n <= self.delete_fail_max
+            ):
+                errors.append({"Key": k, "Code": "InternalError", "Message": "x"})
+            else:
+                self.deleted.append(k)
+                self.objects.pop(k, None)
+        return {"Errors": errors} if errors else {}
 
 
 def make_publisher(**kw):
@@ -160,3 +213,127 @@ def test_dry_run_with_resume_is_rejected():
             publish.parse_args()
     finally:
         sys.argv = argv
+
+
+@pytest.mark.parametrize("flags", [
+    ["--force", "--include-prefix", "s/"],
+    ["--force", "--resume"],
+])
+def test_argparse_rejects_dangerous_flag_pairs(flags):
+    """Both pairs would silently destroy dedup state or waste ops."""
+    argv = sys.argv
+    sys.argv = ["publish.py", *flags]
+    try:
+        with pytest.raises(SystemExit):
+            publish.parse_args()
+    finally:
+        sys.argv = argv
+
+
+# ── --include-prefix semantics ───────────────────────────────────────────
+def test_include_prefix_carries_forward_deferred_stale_digest():
+    """Key that dropped from the DB but is outside the include filter must
+    keep its OLD manifest digest, so the next unfiltered publish still sees
+    it in `stale` and can delete it."""
+    p = make_publisher(include=("s/",))
+    p.manifest = {"s/old.json": "aa",       # in scope, dropped -> should delete
+                  "e/x.json": "bb"}         # out of scope, dropped -> carry
+    p.put("s/keep.json", b"{}")             # in scope, new
+    p.finish()
+    manifest = json.loads(p.client.objects[publish.MANIFEST_KEY])
+    assert manifest["e/x.json"] == "bb", "out-of-scope digest was orphaned"
+    assert "s/old.json" not in manifest, "in-scope stale was not deleted"
+    assert "s/keep.json" in manifest
+    assert p.client.deleted == ["s/old.json"]
+
+
+def test_include_prefix_common_path_put_still_preserves_digest():
+    """Sonnet review: the frequent path is a key that IS produced this run
+    but falls outside --include-prefix. put() must keep its OLD digest and
+    upload nothing. The finish() branch only fires when the key drops from
+    the DB entirely, which is far less common."""
+    p = make_publisher(include=("s/",))
+    p.manifest = {"e/x.json": "old-digest"}
+    p.put("s/keep.json", b"{}")
+    # Same key as in the manifest, but the DB still produces it — put() gets
+    # called this time (unlike the finish-branch case).
+    p.put("e/x.json", b'{"new": true}')
+    p.finish()
+    # Neither uploaded nor deleted; old digest preserved.
+    assert "e/x.json" not in p.client.objects
+    assert p.client.deleted == []
+    manifest = json.loads(p.client.objects[publish.MANIFEST_KEY])
+    assert manifest["e/x.json"] == "old-digest"
+
+
+def test_meta_object_count_after_failure_excludes_failed_keys():
+    """Sonnet #1: meta.json's `objects` count must reflect the *served*
+    manifest, not the run-local next_manifest that still contains failed
+    keys before finish() strips them."""
+    p = make_publisher()
+    p.client.fail_keys = {"bad.json"}
+    p.put("bad.json", b"{}")
+    p.put("good.json", b"{}")
+    p.finish()
+    # main()'s pattern: len(next_manifest) after finish() should exclude bad.
+    assert "bad.json" not in p.next_manifest
+    # meta.json emission wrapper (same shape main() uses)
+    old_include, p.include = p.include, ()
+    old_force, p.force = p.force, True
+    p.put("meta.json", publish.body({"ok": True, "objects": len(p.next_manifest) + 1}))
+    p.flush()
+    p.include, p.force = old_include, old_force
+    doc = json.loads(p.client.objects["meta.json"])
+    assert doc["objects"] == 2  # good.json + meta itself, NOT 3
+
+
+def test_include_prefix_does_not_delete_out_of_scope_keys():
+    p = make_publisher(include=("s/",))
+    p.manifest = {"e/x.json": "bb"}
+    p.put("s/keep.json", b"{}")
+    p.finish()
+    assert "e/x.json" not in p.client.deleted
+
+
+def test_delete_failure_keeps_manifest_entry_for_retry_next_run():
+    """A delete that fails permanently must not have its manifest entry
+    dropped, or the key becomes an undeletable orphan (same class as the
+    stale-forever defect the deletion pass exists to prevent)."""
+    p = make_publisher()
+    p.manifest = {"stale.json": "aa"}
+    p.client.delete_fail_keys = {"stale.json"}
+    # delete_fail_max=None -> fails forever, both attempts inside finish()
+    p.put("new.json", b"{}")
+    p.finish()
+    manifest = json.loads(p.client.objects[publish.MANIFEST_KEY])
+    assert manifest["stale.json"] == "aa", "undeletable key was orphaned"
+    assert p.n_deleted == 0
+
+
+def test_delete_failure_retried_and_succeeds():
+    p = make_publisher()
+    p.manifest = {"stale.json": "aa"}
+    p.client.delete_fail_keys = {"stale.json"}
+    p.client.delete_fail_max = 1        # transient: first call fails, retry wins
+    p.put("new.json", b"{}")
+    p.finish()
+    manifest = json.loads(p.client.objects[publish.MANIFEST_KEY])
+    assert "stale.json" not in manifest
+    assert p.n_deleted == 1
+
+
+def test_meta_object_count_equals_final_manifest_size():
+    """meta.json's `objects` must reflect the served state, not the run-local
+    counter, so /healthz never advertises a partial or stale count."""
+    p = make_publisher()
+    p.put("a.json", b"{}")
+    p.put("b.json", b"{}")
+    # emulate what main() does around meta.json
+    p.finish()
+    old_include, p.include = p.include, ()
+    old_force, p.force = p.force, True
+    p.put("meta.json", publish.body({"ok": True, "objects": len(p.next_manifest) + 1}))
+    p.flush()
+    p.include, p.force = old_include, old_force
+    doc = json.loads(p.client.objects["meta.json"])
+    assert doc["objects"] == 3    # a + b + meta itself

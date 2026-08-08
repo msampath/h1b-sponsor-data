@@ -111,14 +111,19 @@ WHERE sponsors.norm_name(employer_name) IS NOT NULL
 CREATE INDEX ON lca_n (ekey);
 ANALYZE lca_n;
 
--- GC staging, one row per filing. PWD uses suggested_soc_code (1.11M
--- well-formed, 885 junk) rather than pwd_soc_code (740k, 46,950 junk).
+-- GC staging: gc_n_all covers every filing (used for does_gc / totals /
+-- year coverage — "did this employer file a GC petition at all"), while
+-- gc_n filters to well-formed SOC codes for per-SOC breakdowns. Junk-SOC
+-- filings must not vanish from the funnel just because we can't classify
+-- them into a specific occupation.
+-- PWD uses suggested_soc_code (1.11M well-formed, 885 junk) rather than
+-- pwd_soc_code (740k, 46,950 junk).
 -- "Approved" = a determination exists: for PWD everything except Withdrawn
 -- (Determination Issued + the Redetermination / Center-Director outcomes);
 -- for PERM every Certified* variant, including Certified-Expired — the
 -- certification happened, the employer just missed the I-140 window.
-DROP TABLE IF EXISTS gc_n;
-CREATE TEMP TABLE gc_n AS
+DROP TABLE IF EXISTS gc_n_all;
+CREATE TEMP TABLE gc_n_all AS
 SELECT
   sponsors.emp_key(sponsors.norm_ein(p.employer_fein), fm.fein,
                    sponsors.norm_name(p.employer_legal_business_name))       AS ekey,
@@ -129,7 +134,6 @@ SELECT
 FROM pwd_disclosure p
 LEFT JOIN sponsors.fein_map fm ON fm.nm = sponsors.norm_name(p.employer_legal_business_name)
 WHERE sponsors.norm_name(p.employer_legal_business_name) IS NOT NULL
-  AND sponsors.norm_soc(p.suggested_soc_code) IS NOT NULL
   AND COALESCE(p.determination_date, p.received_date) IS NOT NULL
 UNION ALL
 SELECT
@@ -142,9 +146,16 @@ SELECT
 FROM perm_disclosure p
 LEFT JOIN sponsors.fein_map fm ON fm.nm = sponsors.norm_name(p.employer_name)
 WHERE sponsors.norm_name(p.employer_name) IS NOT NULL
-  AND sponsors.norm_soc(p.pw_soc_code) IS NOT NULL
   AND COALESCE(p.decision_date, p.received_date) IS NOT NULL;
 
+CREATE INDEX ON gc_n_all (ekey);
+ANALYZE gc_n_all;
+
+-- gc_n = gc_n_all restricted to filings whose SOC parses; drives
+-- gc_filings (per-SOC evidence) and the gc_by_soc JSON.
+DROP TABLE IF EXISTS gc_n;
+CREATE TEMP TABLE gc_n AS
+SELECT * FROM gc_n_all WHERE soc IS NOT NULL;
 CREATE INDEX ON gc_n (ekey);
 ANALYZE gc_n;
 
@@ -181,6 +192,18 @@ WHERE sponsors.norm_name(p.employer_name) IS NOT NULL;
 ANALYZE emp_src;
 
 -- ── load ─────────────────────────────────────────────────────────────────
+-- Drop indexes BEFORE the bulk INSERT, not after. TRUNCATE leaves indexes
+-- in place, so on any re-run the ~4.9M-row inserts paid full index
+-- maintenance cost and then paid drop+rebuild anyway. The trailing
+-- CREATE INDEX block (after COMMIT) still rebuilds them freshly.
+DROP INDEX IF EXISTS sponsors.jobs_by_employer;
+DROP INDEX IF EXISTS sponsors.gc_by_employer;
+DROP INDEX IF EXISTS sponsors.gc_by_emp_soc;
+DROP INDEX IF EXISTS sponsors.titles_by_employer;
+DROP INDEX IF EXISTS sponsors.titles_by_title;
+DROP INDEX IF EXISTS sponsors.bench_lookup;
+DROP INDEX IF EXISTS sponsors.employers_name;
+DROP INDEX IF EXISTS sponsors.employers_ein;
 
 BEGIN;
 
@@ -314,9 +337,11 @@ agg AS (
   FROM base GROUP BY id
 ),
 lvl AS (
-  SELECT id, jsonb_object_agg(level, c) AS j
+  -- Bucket NULL as 'unknown' so the profile's level_mix matches the same
+  -- field in job_titles (validator B: same-named field should not diverge).
+  SELECT id, jsonb_object_agg(COALESCE(level, 'unknown'), c) AS j
   FROM (SELECT id, level, COUNT(*) AS c FROM base
-        WHERE level IS NOT NULL GROUP BY id, level) t
+        GROUP BY id, level) t
   GROUP BY id
 ),
 trend AS (
@@ -347,8 +372,23 @@ soc_year AS (
   ) b GROUP BY id
 ),
 gcb AS (
+  -- Use the unfiltered staging: does_gc / n_pwd / n_perm / year coverage
+  -- must NOT exclude junk-SOC filings — that's a different question from
+  -- "which SOCs did this employer file for" (validator B tail #30).
   SELECT e.id, g.year, g.typ, g.soc, g.approved
-  FROM gc_n g JOIN sponsors.employers e ON e.key = g.ekey
+  FROM gc_n_all g JOIN sponsors.employers e ON e.key = g.ekey
+),
+gcb_socced AS (
+  -- gc_by_soc still restricts to well-formed SOC (junk SOCs would create
+  -- garbage buckets in the per-SOC breakdown).
+  SELECT id, year, typ, soc, approved FROM gcb WHERE soc IS NOT NULL
+),
+gc_years AS (
+  -- GC-only employers (~70k, ~42% of the union) had null first/last years
+  -- because the year aggregate read LCA rows only. Widening to include
+  -- GC filings closes it (validator B tail #65).
+  SELECT id, MIN(year) AS first_year, MAX(year) AS last_year
+  FROM gcb GROUP BY id
 ),
 gc_tot AS (
   SELECT id,
@@ -375,11 +415,15 @@ gc_soc AS (
     SELECT id, soc, jsonb_build_object(
              'pwd',  COUNT(*) FILTER (WHERE typ = 'PWD'),
              'perm', COUNT(*) FILTER (WHERE typ = 'PERM')) AS o
-    FROM gcb GROUP BY id, soc
+    FROM gcb_socced GROUP BY id, soc
   ) t GROUP BY id
 )
 SELECT
-  e.id, a.first_year, a.last_year,
+  e.id,
+  -- LEAST/GREATEST handle NULLs by returning the non-null side (no LCA rows
+  -- OR no GC rows), which gives a real year for both edge cases.
+  LEAST(a.first_year, gyr.first_year)      AS first_year,
+  GREATEST(a.last_year, gyr.last_year)     AS last_year,
   COALESCE(a.n_lca, 0), COALESCE(a.n_certified, 0), COALESCE(a.n_cw, 0),
   COALESCE(a.n_denied, 0), COALESCE(a.n_withdrawn, 0),
   COALESCE(a.n_new, 0), COALESCE(a.n_transfer, 0), COALESCE(a.n_continued, 0),
@@ -402,27 +446,20 @@ SELECT
       'value', COALESCE(a.n_willful, 0) > 0,
       'n_yes', COALESCE(a.n_willful, 0), 'n_total', COALESCE(a.n_lca, 0)))
 FROM sponsors.employers e
-LEFT JOIN agg      a  ON a.id  = e.id
-LEFT JOIN lvl      lv ON lv.id = e.id
-LEFT JOIN trend    tr ON tr.id = e.id
-LEFT JOIN soc_year sy ON sy.id = e.id
-LEFT JOIN gc_tot   gt ON gt.id = e.id
-LEFT JOIN gc_year  gy ON gy.id = e.id
-LEFT JOIN gc_soc   gs ON gs.id = e.id;
+LEFT JOIN agg      a   ON a.id   = e.id
+LEFT JOIN gc_years gyr ON gyr.id = e.id
+LEFT JOIN lvl      lv  ON lv.id  = e.id
+LEFT JOIN trend    tr  ON tr.id  = e.id
+LEFT JOIN soc_year sy  ON sy.id  = e.id
+LEFT JOIN gc_tot   gt  ON gt.id  = e.id
+LEFT JOIN gc_year  gy  ON gy.id  = e.id
+LEFT JOIN gc_soc   gs  ON gs.id  = e.id;
 
 COMMIT;
 
 -- ── indexes ──────────────────────────────────────────────────────────────
--- Built after the load; maintaining them during bulk INSERT costs more than
--- one rebuild at the end.
-DROP INDEX IF EXISTS sponsors.jobs_by_employer;
-DROP INDEX IF EXISTS sponsors.gc_by_employer;
-DROP INDEX IF EXISTS sponsors.gc_by_emp_soc;
-DROP INDEX IF EXISTS sponsors.titles_by_employer;
-DROP INDEX IF EXISTS sponsors.titles_by_title;
-DROP INDEX IF EXISTS sponsors.bench_lookup;
-DROP INDEX IF EXISTS sponsors.employers_name;
-DROP INDEX IF EXISTS sponsors.employers_ein;
+-- The load ran without any indexes on sponsors.* (DROPs are above BEGIN);
+-- build them fresh here after COMMIT.
 CREATE INDEX jobs_by_employer   ON sponsors.jobs (employer_id);
 CREATE INDEX gc_by_employer     ON sponsors.gc_filings (employer_id);
 CREATE INDEX gc_by_emp_soc      ON sponsors.gc_filings (employer_id, soc_code);

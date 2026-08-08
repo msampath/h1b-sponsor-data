@@ -72,16 +72,19 @@ describe("BucketMeter", () => {
     expect(first.retryAfter).toBeLessThanOrEqual(121);
   });
 
-  it("suppresses lockout state writes to one per 30s window", async () => {
+  it("performs ZERO storage writes for any request during a lockout", async () => {
+    // The old code kept a lastNoteAt field just to throttle its own writes;
+    // with no other state changing during a lockout there is nothing to
+    // persist at all. See super-review-retest-report.md.
     const { m, putCount } = meter();
     for (let i = 0; i < LIMITS.anon; i++) await take(m);
     await take(m); // exhaustion write sets lockout
     const before = putCount();
     for (let i = 0; i < 5; i++) {
       vi.advanceTimersByTime(1000);
-      await take(m); // tight retry loop inside the window
+      await take(m);
     }
-    expect(putCount()).toBe(before); // no additional writes
+    expect(putCount()).toBe(before);
   });
 
   it("keyed tier gets its own limit", async () => {
@@ -96,9 +99,20 @@ describe("BucketMeter", () => {
     expect(res.status).toBe(500);
   });
 
+  it("rejects prototype-chain names like toString (Object.hasOwn, not `in`)", async () => {
+    // `tier in LIMITS` was bypassable via the prototype chain; a crafted
+    // tier of "toString" or "constructor" would reach state math and mint
+    // NaN tokens. Object.hasOwn stops it at the door.
+    const { m } = meter();
+    for (const bad of ["toString", "constructor", "__proto__"]) {
+      const res = await take(m, bad);
+      expect(res.status).toBe(500);
+    }
+  });
+
   it("clamps stored tokens if a redeploy lowered the limit", async () => {
     const store = new Map<string, unknown>([
-      ["s", { tokens: 9999, refilledAt: Date.now(), lockoutUntil: 0, lastNoteAt: 0 }],
+      ["s", { tokens: 9999, refilledAt: Date.now(), lockoutUntil: 0 }],
     ]);
     const state = {
       storage: { get: async () => store.get("s"), put: async (_: string, v: unknown) => store.set("s", v) },

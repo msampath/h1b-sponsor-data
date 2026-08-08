@@ -30,9 +30,12 @@ That leaves two genuine misses from the fix batch:
    or `npx wrangler dev --remote`. README.md:113, package.json:7.
 2. The compat-date drift (original idx 40) was deferred as an owner decision
    but never listed in the report's declined section, so it silently vanished
-   from the record. wrangler.toml pins compatibility_date 2025-08-01 while
-   the installed workers-types describe the 2026 runtime surface. Still open,
-   still the owner's call; now recorded.
+   from the record. wrangler.toml pinned compatibility_date 2025-08-01 while
+   the installed workers-types described the 2026 runtime surface. Owner
+   decision at retest planning: bumped to 2026-08-08 and deployed as Version
+   e85cb8b9-c6ae-41dc-903e-a968214a6e6c; the live smoke suite (lowercase
+   bearer -> 401 keyed, %zz -> 400, vary: origin on 200/401/404/OPTIONS,
+   If-Match stale -> 412, If-None-Match match -> 304) passed against it.
 
 ## New defects introduced by the fix batch
 
@@ -113,6 +116,19 @@ would close that class. publish.py:290.
 - The self-hosting README note promised in triage as the compensating action
   for declined finding 26 was never written. A declined finding's mitigation
   silently not happening is a process defect worth naming. README.md.
+
+## Known residual gaps (deliberate)
+
+- serveFirst probes the longest available prefix, its two shorter neighbors,
+  depth 3, and depth 2 (five max). For a query longer than 5 chars whose
+  overflow chain stops more than two depths above it, the intermediate
+  bucket is not reached — a name outside the top 50 of the shallower
+  bucket can still be unreachable via the exact query. Closing this fully
+  would need per-lineage depth pointers stored in the shallow bucket
+  objects so the Worker knows the chain length from one read.
+- serve() maps every body-less R2 hit with an If-Match header to 412 even
+  if the caller also sent If-None-Match that would have matched. Real read
+  clients don't send both preconditions; recording it as info-only.
 
 ## Additional confirmed items from the validator tail round
 

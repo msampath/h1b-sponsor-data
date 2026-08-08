@@ -5,7 +5,7 @@ import type {
   IncomingRequestCfProperties,
   R2Bucket,
 } from "@cloudflare/workers-types";
-import { BucketMeter, type Tier } from "./ratelimit";
+import { BucketMeter, type RateVerdict, type Tier } from "./ratelimit";
 import {
   json,
   keys,
@@ -74,10 +74,16 @@ type Caller =
   | { tier: Tier; bucketKey: string }
   | { unknownKey: true };
 
+// RFC 6750: the scheme name is case-insensitive. `startsWith("Bearer ")`
+// silently dropped a lowercase `bearer` header to the anon tier, sidestepping
+// the 401 contract on unknown keys.
+const BEARER_RE = /^\s*bearer\s+(\S.*)$/i;
+
 /** Classify the caller. A presented-but-unknown key is a 401, not silent anon. */
 export async function classify(request: CfRequest, env: Env): Promise<Caller> {
   const auth = request.headers.get("authorization");
-  const token = auth?.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  const match = auth ? BEARER_RE.exec(auth) : null;
+  const token = match ? match[1].trim() : "";
 
   if (token) {
     const hash = await sha256Hex(token);
@@ -97,20 +103,17 @@ export async function classify(request: CfRequest, env: Env): Promise<Caller> {
   return { tier: "anon", bucketKey: `anon|${ip}|${asn}` };
 }
 
-interface RateVerdict {
-  ok: boolean;
-  limit: number;
-  remaining: number;
-  resetAt: number;
-  retryAfter: number;
-}
-
 export default {
   async fetch(request: CfRequest, env: Env): Promise<Response> {
     const cors = corsHeaders(request);
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: cors });
+      // vary: origin on every response, including preflight — without it a
+      // shared cache could mix origin variants of the CORS reply too.
+      return new Response(null, {
+        status: 204,
+        headers: { ...cors, vary: "origin" },
+      });
     }
     if (request.method !== "GET") {
       return json({ error: "method not allowed" }, 405, cors);
