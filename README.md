@@ -1,8 +1,10 @@
 # h1b-sponsor-data
 
 A rate limited public API over six years of DOL immigration disclosures: H-1B
-LCA, PWD, and PERM. 335,626 employers, 1.87M wage rows, 759,638 green card
-filings. Cloudflare Workers and R2, free tier.
+LCA, PWD, and PERM (signals of immigration support by employers). 335,626 employers, 1.87M wage rows, 759,638 green card
+filings. Cloudflare Workers and R2, free tier
+
+**Updated as of latest disclosure data from DOL as of Q2 FY2026**
 
 Portfolio: [surakshith.com/portfolio](https://surakshith.com/portfolio)
 Base URL: `https://api.surakshith.com/immigration/v1`
