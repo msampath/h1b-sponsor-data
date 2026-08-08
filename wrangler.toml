@@ -1,0 +1,25 @@
+name = "h1b-sponsor-data"
+main = "worker/index.ts"
+compatibility_date = "2025-08-01"
+
+# Custom domain. custom_domain = true makes wrangler create the hostname and
+# its DNS record on deploy. It only touches api.surakshith.com; the apex A
+# record stays as it is, which matters because Firebase needs it grey-cloud.
+routes = [
+  { pattern = "api.surakshith.com", custom_domain = true }
+]
+
+[[r2_buckets]]
+binding = "DATA"
+bucket_name = "h1b-sponsor-data"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["BucketMeter"]   # free tier requires the SQLite backend
+
+[[durable_objects.bindings]]
+name = "BUCKET"
+class_name = "BucketMeter"
+
+# API_KEYS is a secret, not a var:
+#   wrangler secret put API_KEYS      # {"<sha256-of-token>": "career-ops"}
