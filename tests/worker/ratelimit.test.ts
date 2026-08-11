@@ -24,6 +24,12 @@ function take(m: BucketMeter, tier = "anon") {
   );
 }
 
+function give(m: BucketMeter, tier = "mint") {
+  return m.fetch(
+    new Request("https://do/give", { method: "POST", body: JSON.stringify({ tier }) }),
+  );
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(1_800_000_000_000);
@@ -93,6 +99,49 @@ describe("BucketMeter", () => {
     expect(r.limit).toBe(LIMITS.keyed);
   });
 
+  it("mint tier refills over a day: 2 keys, then an honest 12-hour cool-off", async () => {
+    const { m } = meter();
+    for (let i = 0; i < LIMITS.mint; i++) {
+      const r = (await (await take(m, "mint")).json()) as { ok: boolean };
+      expect(r.ok).toBe(true);
+    }
+    const denied = (await (await take(m, "mint")).json()) as { ok: boolean; retryAfter: number };
+    expect(denied.ok).toBe(false);
+    // 2 tokens per 24h is one every 12h, so that is what Retry-After must say.
+    expect(denied.retryAfter).toBeGreaterThanOrEqual(43_190);
+    expect(denied.retryAfter).toBeLessThanOrEqual(43_210);
+
+    vi.advanceTimersByTime(denied.retryAfter * 1000);
+    const after = (await (await take(m, "mint")).json()) as { ok: boolean };
+    expect(after.ok).toBe(true); // waiting it out yields a token, as advertised
+  });
+
+  it("mintGlobal carries the daily cap on issuance for everyone", async () => {
+    const { m } = meter();
+    const r = (await (await take(m, "mintGlobal")).json()) as { limit: number };
+    expect(r.limit).toBe(LIMITS.mintGlobal);
+  });
+
+  it("a limit of 0 (the kill switch) denies with a finite Retry-After", async () => {
+    // Zeroing a tier's limit and redeploying is the documented way to stop
+    // issuance. Dividing by it advertised Retry-After: Infinity, a header
+    // value no client can act on.
+    const limits = LIMITS as unknown as Record<string, number>;
+    const original = limits.mintGlobal;
+    limits.mintGlobal = 0;
+    try {
+      const { m } = meter();
+      const r = (await (await take(m, "mintGlobal")).json()) as {
+        ok: boolean;
+        retryAfter: number;
+      };
+      expect(r.ok).toBe(false);
+      expect(Number.isFinite(r.retryAfter)).toBe(true);
+    } finally {
+      limits.mintGlobal = original;
+    }
+  });
+
   it("rejects an unknown tier loudly instead of minting NaN state", async () => {
     const { m } = meter();
     const res = await take(m, "root");
@@ -108,6 +157,34 @@ describe("BucketMeter", () => {
       const res = await take(m, bad);
       expect(res.status).toBe(500);
     }
+  });
+
+  it("lookup tier gets its own hourly limit", async () => {
+    const { m } = meter();
+    const r = (await (await take(m, "lookup")).json()) as { limit: number };
+    expect(r.limit).toBe(LIMITS.lookup);
+  });
+
+  it("/give refunds a spent token so a downstream deny does not cost the caller", async () => {
+    const { m } = meter();
+    // Spend the whole mint bucket, then confirm it is empty.
+    for (let i = 0; i < LIMITS.mint; i++) await take(m, "mint");
+    const empty = (await (await take(m, "mint")).json()) as { ok: boolean };
+    expect(empty.ok).toBe(false);
+    // One refund, and the next take is served again — the token really came back.
+    const credited = (await (await give(m, "mint")).json()) as { ok: boolean; remaining: number };
+    expect(credited.ok).toBe(true);
+    expect(credited.remaining).toBe(1);
+    const reused = (await (await take(m, "mint")).json()) as { ok: boolean };
+    expect(reused.ok).toBe(true);
+  });
+
+  it("/give never overfills a bucket beyond its limit", async () => {
+    const { m } = meter();
+    for (let i = 0; i < 5; i++) await give(m, "mint"); // refunds against a full bucket
+    const r = (await (await take(m, "mint")).json()) as { remaining: number };
+    // A full mint bucket is 2; after one take, exactly 1 remains, never more.
+    expect(r.remaining).toBe(LIMITS.mint - 1);
   });
 
   it("clamps stored tokens if a redeploy lowered the limit", async () => {

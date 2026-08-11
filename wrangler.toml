@@ -13,6 +13,12 @@ routes = [
 binding = "DATA"
 bucket_name = "h1b-sponsor-data"
 
+# Self-serve keys: sha256(token) -> metadata JSON. Run
+# `npx wrangler kv namespace create KEYS` and paste the printed id below.
+[[kv_namespaces]]
+binding = "KEYS"
+id = "b0cd09dae5764d93af5da5544a47b1fc"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["BucketMeter"]   # free tier requires the SQLite backend

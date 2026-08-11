@@ -8,7 +8,8 @@ filings. Cloudflare Workers and R2, free tier
 
 Portfolio: [surakshith.com/portfolio](https://surakshith.com/portfolio)
 Base URL: `https://api.surakshith.com/immigration/v1`
-API key: email `sms@surakshith.com`
+Data source: [DOL foreign labor performance data](https://www.dol.gov/agencies/eta/foreign-labor/performance)
+API key: `curl -X POST https://api.surakshith.com/immigration/v1/keys/request`
 
 ## Endpoints
 
@@ -55,12 +56,45 @@ the worker at a third party client site.
 
 ## Rate limits
 
-- Anonymous: 30 requests/hour per (IP, ASN).
+- Anonymous: 30 requests/hour per (IP, ASN). IPv6 is bucketed by /64.
 - Keyed: 200 requests/hour, bucketed by key.
-- Every response carries `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and
+- Every read response carries `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and
   `X-RateLimit-Reset`. A 429 adds `Retry-After` set to the time until the
   next token refills, so a client that respects it is never re-denied.
+  `POST /keys/request` is not a read and carries only `Retry-After` on a 429;
+  so does a 429 from the key-validation meter, the one a flood of unrecognized
+  tokens meets before any KV read.
 - No escalation ladder. The bucket alone is the protection.
+
+## API keys
+
+Anonymous access needs no key. A key raises the ceiling to 200 requests/hour
+and issues itself:
+
+```bash
+curl -X POST https://api.surakshith.com/immigration/v1/keys/request
+```
+
+```json
+{"token": "h1b_a3f1...", "tier": "keyed", "limit": 200,
+ "note": "A new key can take up to about 60 seconds to be recognized on every server. If a request returns 401 in the first minute, wait and retry."}
+```
+
+Send it back as `Authorization: Bearer <token>`. The token is shown once and
+only its sha256 is stored, so a lost key means asking for another one.
+
+Issuance is metered with a token bucket per (IP, ASN): 2 available at once,
+then one more every 12 hours, so a long-idle requester can mint 2 back to back
+and a busy day tops out around 4. A global bucket of the same shape brakes
+total issuance at roughly 200 to 400 per day. Validating a presented key costs
+one metered lookup per (IP, ASN) on a cache miss, so a flood of junk tokens
+cannot amplify into unbounded KV reads; the charge is handed back when the read
+proves the token genuine, so a real key keeps its full 200 requests/hour even
+when every request lands on a server that has not seen it before. A request
+carrying an `Origin` header
+is refused, since a browser always sends one and a page has no business minting
+keys on a visitor's behalf. If any of that gets in your way, email
+`sms@surakshith.com`.
 
 ## Architecture
 
@@ -225,22 +259,60 @@ ship as they are. `wage_benchmarks` is gated at n>=5 for its ZIP tier.
 ## Deploy
 
 ```bash
+npx wrangler kv namespace create KEYS   # paste the printed id into wrangler.toml
 npx wrangler deploy
-npx wrangler secret put API_KEYS     # {"<sha256-of-token>": "career-ops"}
+npx wrangler secret put API_KEYS        # {"<sha256-of-token>": "career-ops"}
+```
+
+`API_KEYS` holds keys you hand out yourself. It is a secret parsed once per
+isolate, so those keys keep working through a KV outage. Self-serve keys live
+in the `KEYS` namespace instead. Smoke test issuance after a deploy, then use
+what it returns:
+
+```bash
+curl -X POST https://api.surakshith.com/immigration/v1/keys/request
+curl -H "Authorization: Bearer h1b_..." \
+  "https://api.surakshith.com/immigration/v1/employers/search?q=amazon"
 ```
 
 Attach `api.surakshith.com` under Workers, h1b-sponsor-data, Settings,
 Domains and Routes. Or set `routes = [{ pattern = "api.<yours>",
 custom_domain = true }]` in `wrangler.toml` so a redeploy reasserts it.
 
+### Administering self-serve keys
+
+```bash
+npx wrangler kv key list --binding KEYS --remote             # audit every key
+npx wrangler kv key get <sha256> --binding KEYS --remote     # inspect one
+npx wrangler kv key delete <sha256> --binding KEYS --remote  # revoke one
+```
+
+The key name is the sha256 of the token, and the value holds `label`,
+`createdAt`, and `requestor`. `requestor` is a sha256 of the IP and ASN that
+asked, which is enough to spot one caller minting in bulk across a listing
+without keeping an address on disk. There is no revoked flag: a delete is the
+revocation, so nothing downstream can forget to check it.
+
+Kill switch: set `mintGlobal` to 0 in `worker/ratelimit.ts` and redeploy. New
+keys stop being issued and every key already out there keeps working.
+
+Three limits come with this design and are accepted rather than fixed:
+
+- A fresh key can 401 for about 60 seconds on servers other than the isolate
+  that minted it, until KV converges. The 201 body says so, and a retry works.
+- A revoked key can keep working for up to about 2 minutes, since each isolate
+  caches a positive lookup for 60 seconds and may have just refreshed one.
+- Issuance is braked at roughly 200 to 400 keys per day across all callers.
+  Past that, everyone waits for the bucket to refill.
+
 ## Self-hosting
 
-Two touch points to change under a different domain:
+Three things to change under a different domain, across two files:
 
 - `worker/index.ts`: `ALLOWED_ORIGINS`, the CORS allowlist for browsers
   calling the API from your site's origin.
 - `wrangler.toml`: the `routes` block, the hostname the Worker is bound
-  to.
+  to, and the `KEYS` KV namespace id from `wrangler kv namespace create KEYS`.
 
 `api.surakshith.com` in the README and its own CORS entries are the
 owner's config. Nothing else in the code knows about the specific

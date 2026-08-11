@@ -1,11 +1,21 @@
-// Entry point: CORS → route → auth → rate limit → stream from R2.
+// Entry point: CORS → key issuance (POST) → route → auth → rate limit →
+// stream from R2.
 
 import type {
   DurableObjectNamespace,
   IncomingRequestCfProperties,
+  KVNamespace,
   R2Bucket,
 } from "@cloudflare/workers-types";
-import { BucketMeter, type RateVerdict, type Tier } from "./ratelimit";
+import {
+  cachedKeyLabel,
+  dynamicKeyLabel,
+  giveToken,
+  mintKey,
+  sha256Hex,
+  takeToken,
+} from "./keys";
+import { BucketMeter, bucketIp, type RateVerdict, type Tier } from "./ratelimit";
 import {
   json,
   keys,
@@ -22,9 +32,12 @@ export interface Env {
   BUCKET: DurableObjectNamespace;
   /** JSON map of sha256(token) -> label. Set with `wrangler secret put API_KEYS`. */
   API_KEYS?: string;
+  /** sha256(token) -> key metadata JSON, for self-serve keys. Optional so a
+   *  deployment (or a test) without the namespace still runs, key-less. */
+  KEYS?: KVNamespace;
 }
 
-type CfRequest = Request<unknown, IncomingRequestCfProperties>;
+export type CfRequest = Request<unknown, IncomingRequestCfProperties>;
 
 const PREFIX = "/immigration/v1";
 const ALLOWED_ORIGINS = new Set(["https://surakshith.com", "https://www.surakshith.com"]);
@@ -42,11 +55,6 @@ function corsHeaders(request: Request): Record<string, string> {
     "access-control-max-age": "86400",
     vary: "origin",
   };
-}
-
-async function sha256Hex(s: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 // API_KEYS is a handful of entries and immutable per deployment; parse once
@@ -72,7 +80,8 @@ export function keyTable(env: Env): Record<string, string> {
 
 type Caller =
   | { tier: Tier; bucketKey: string }
-  | { unknownKey: true };
+  | { unknownKey: true }
+  | { throttled: true; retryAfter: number };
 
 // RFC 6750: the scheme name is case-insensitive. `startsWith("Bearer ")`
 // silently dropped a lowercase `bearer` header to the anon tier, sidestepping
@@ -85,6 +94,13 @@ export async function classify(request: CfRequest, env: Env): Promise<Caller> {
   const match = auth ? BEARER_RE.exec(auth) : null;
   const token = match ? match[1].trim() : "";
 
+  // (IP, ASN) identity, shared by the anon bucket and the lookup throttle.
+  // IPv6 collapses to its /64 so a client cannot walk its address space to
+  // dodge a per-address limit; the ASN disambiguates the same IP across
+  // networks.
+  const ip = bucketIp(request.headers.get("cf-connecting-ip") ?? "0.0.0.0");
+  const asn = request.cf?.asn ?? 0;
+
   if (token) {
     const hash = await sha256Hex(token);
     if (hash in keyTable(env)) {
@@ -92,14 +108,39 @@ export async function classify(request: CfRequest, env: Env): Promise<Caller> {
       // quota everywhere rather than minting a fresh one per network.
       return { tier: "keyed", bucketKey: `keyed|${hash}` };
     }
+    // Self-serve keys live in KV. Static keys resolved above and never pay
+    // this lookup, so the operator's own keys keep working through a KV
+    // outage. Both kinds share the keyed bucket namespace and the keyed limit.
+    if (env.KEYS) {
+      // A key already seen on this isolate is free to re-check.
+      if (cachedKeyLabel(hash)) return { tier: "keyed", bucketKey: `keyed|${hash}` };
+      // Cache miss means a KV read, which is the step a flood of junk tokens
+      // could amplify (each miss is one read, and the positive-only cache
+      // never absorbs junk). Meter that read per (IP, ASN) first. A clean deny
+      // throttles the flood; a DO failure (null) fails OPEN to the read, since
+      // the read path already trades availability for a DO outage and the KV
+      // lookup still fails closed to 401 on its own errors.
+      const lookupBucket = `lookup|${ip}|${asn}`;
+      const gate = await takeToken(env, lookupBucket, "lookup");
+      if (gate && !gate.ok) return { throttled: true, retryAfter: gate.retryAfter };
+      const label = await dynamicKeyLabel(env, hash);
+      if (label) {
+        // The read proved the token genuine, so refund the charge: this meter
+        // exists to bound junk, not to ration a real key holder's reads. Only
+        // a miss that stays a miss should cost. Without the refund a client
+        // whose requests keep landing on cold isolates — or one sharing an
+        // egress IP with other key holders — is cut off at `lookup` (120/h)
+        // instead of the `keyed` limit (200/h) its key was issued with, and
+        // the 429 that ends it carries no x-ratelimit headers to explain why.
+        // `gate` is non-null here, so a token really was spent.
+        if (gate) await giveToken(env, lookupBucket, "lookup");
+        return { tier: "keyed", bucketKey: `keyed|${hash}` };
+      }
+    }
     return { unknownKey: true };
   }
 
-  // Anonymous: (IP, ASN). The IP is part of the key, so each address gets
-  // its own bucket; the ASN only disambiguates the same IP seen via
-  // different networks.
-  const ip = request.headers.get("cf-connecting-ip") ?? "0.0.0.0";
-  const asn = request.cf?.asn ?? 0;
+  // Anonymous: one bucket per (IP, ASN).
   return { tier: "anon", bucketKey: `anon|${ip}|${asn}` };
 }
 
@@ -115,11 +156,18 @@ export default {
         headers: { ...cors, vary: "origin" },
       });
     }
+    // Issuance is the one write in the API, so the URL has to be parsed
+    // before the read-only method gate rather than after it.
+    const url = new URL(request.url);
+    if (request.method === "POST") {
+      return url.pathname === PREFIX + "/keys/request"
+        ? mintKey(request, env, cors)
+        : json({ error: "method not allowed" }, 405, cors);
+    }
     if (request.method !== "GET") {
       return json({ error: "method not allowed" }, 405, cors);
     }
 
-    const url = new URL(request.url);
     if (!url.pathname.startsWith(PREFIX)) return json({ error: "not found" }, 404, cors);
     const path = url.pathname.slice(PREFIX.length);
 
@@ -130,6 +178,12 @@ export default {
     }
 
     const caller = await classify(request, env);
+    if ("throttled" in caller) {
+      return json({ error: "rate limit exceeded" }, 429, {
+        ...cors,
+        "retry-after": String(caller.retryAfter),
+      });
+    }
     if ("unknownKey" in caller) {
       return json({ error: "invalid API key" }, 401, cors);
     }
