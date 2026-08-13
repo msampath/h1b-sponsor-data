@@ -96,6 +96,89 @@ is refused, since a browser always sends one and a page has no business minting
 keys on a visitor's behalf. If any of that gets in your way, email
 `sms@surakshith.com`.
 
+## Downloadable index
+
+Every call to the API tells this service which employers someone is looking
+up, and someone looking up sponsorship history is telling you they need a
+visa. The headline numbers do not need a service to answer them: 12 fields
+for all 335,626 employers is 7.9 MB gzipped, so a client downloads the file
+once a quarter and answers locally. Nothing about the query leaves the
+machine.
+
+```bash
+curl -sL https://github.com/msampath/h1b-sponsor-data/releases/latest/download/index-latest.json
+curl -OL https://github.com/msampath/h1b-sponsor-data/releases/latest/download/index-2026Q2.ndjson.gz
+```
+
+`index-latest.json` is the pointer: `{version, built_at, employers, bytes,
+sha256, filename}`. Read `filename` out of it instead of hardcoding the
+quarter, and check the download against `sha256`.
+
+The data is gzipped NDJSON, one employer per line, sorted by normalized name
+then key. The normalization is `norm_name` in `etl/publish.py`, the same one
+`/employers/search` buckets by, so a local scan and a search agree on what a
+name is. A cold lookup by streaming scan is 0.34s and 40 companies in one
+pass is 3.37s, which is why this is one file and not sharded.
+
+```json
+{"k":"204938068","n":"Amazon Web Services, Inc.","fy":2019,"ly":2026,"lca":24611,"pwd":4313,"perm":3828,"gc":true,"sv":false,"sh":0.02,"ns":512,"nt":24611}
+```
+
+| Field | Is |
+| --- | --- |
+| `k` | employer key, the same `:id` the API endpoints take |
+| `n` | employer name as DOL published it |
+| `fy` / `ly` | first and last year seen, across LCA and green card filings |
+| `lca` | H-1B filings, resolved as `certified ?? lca ?? 0` against the API's `filings` block |
+| `pwd` / `perm` | prevailing wage and PERM filings, the two green card steps |
+| `gc` | true when either exists, i.e. `green_card.evidence == "present"` |
+| `sv` | the `staffing_shop` red flag |
+| `sh` / `ns` / `nt` | its evidence: secondary entity share, that count, and the LCA total it is a share of |
+
+`lca` is a certified count, since `n_certified` is never null and so the
+coalesce never reaches past it. `nt` is the unfiltered LCA total, so the two
+differ for the 50,755 employers carrying a denial or a withdrawal. That is
+not a discrepancy, it is the two numbers the API also reports separately as
+`filings.certified` and `filings.lca`. The coalesce is resolved at build
+time on purpose: a local answer and an HTTP answer to the same question must
+not come out differently.
+
+Not in the file: jobs, titles, wage benchmarks, and typeahead search. Those
+are per-request shapes with no small precomputed form, and they stay on the
+API. Derived from the same public
+[DOL disclosure files](https://www.dol.gov/agencies/eta/foreign-labor/performance)
+as everything else here.
+
+### Cutting a release
+
+Build, then attach both files to a release tagged with the quarter:
+
+```bash
+python etl/publish_index.py          # -> etl/dist/, ~15s
+VERSION=$(python -c "import json;print(json.load(open('etl/dist/index-latest.json'))['version'])")
+
+gh release create "$VERSION" \
+  --repo msampath/h1b-sponsor-data \
+  --title "Employer index $VERSION" \
+  --notes "Per-employer headline numbers, FY2020 through $VERSION. Derived from DOL OFLC disclosure data." \
+  "etl/dist/index-$VERSION.ndjson.gz" etl/dist/index-latest.json
+```
+
+Re-running a build over unchanged data produces byte-identical output (the
+gzip header carries no mtime and no filename), so a re-publish that changed
+nothing does not make every client re-download. To replace assets on a tag
+that already exists:
+
+```bash
+gh release upload "$VERSION" "etl/dist/index-$VERSION.ndjson.gz" \
+  etl/dist/index-latest.json --clobber
+```
+
+Accepted constraint: the `releases/latest/download/` path resolves to the
+newest release of any kind, so data releases have to be the only ones in
+this repo. If code releases ever get tagged here, mark them `--prerelease`
+or the documented client path starts 404ing.
+
 ## Architecture
 
 ```
@@ -103,11 +186,16 @@ lca (Postgres)
 ├── public.*     raw DOL disclosures, read only, never written
 └── sponsors.*   curated serving layer   <- sql/*.sql
                        │
-                       │ etl/publish.py (boto3 to R2, manifest diffed)
-                       v
-                 R2: h1b-sponsor-data     ~760k precomputed JSON objects
-                       ^
-                 Worker (api.surakshith.com) -> BucketMeter DO for rate limiting
+                       ├─ etl/publish.py (boto3 to R2, manifest diffed)
+                       │       v
+                       │  R2: h1b-sponsor-data    ~760k precomputed JSON objects
+                       │       ^
+                       │  Worker (api.surakshith.com) -> BucketMeter DO for rate limiting
+                       │
+                       └─ etl/publish_index.py
+                               v
+                          GitHub Release: index-<quarter>.ndjson.gz
+                          335k employers, 7.9 MB, scanned on the client
 ```
 
 R2 instead of D1, because D1's free tier is 100,000 row writes per day and
@@ -155,6 +243,7 @@ python etl/build.py               # raw to sponsors schema, runs verification ga
 python etl/build.py --verify-only # re-run the gates without rebuilding
 python etl/publish.py --dry-run   # object count and bytes, uploads nothing
 python etl/publish.py             # uploads changed objects only (manifest diff)
+python etl/publish_index.py       # downloadable index -> etl/dist/, never touches R2
 ```
 
 `publish.py` also takes `--resume` (after an interrupted run, lists the
@@ -162,6 +251,11 @@ bucket and skips what already landed), `--limit N` (exercise the real
 upload path on N objects; never writes the manifest), and
 `--include-prefix P` (publish only keys under a prefix, e.g. just the `s/`
 search tiers).
+
+`publish_index.py` takes `--out DIR` and `--limit N`. A `--limit` run writes
+a partial file and no `index-latest.json`, on the same reasoning that keeps
+a `--limit` publish from writing the manifest: the pointer is what makes a
+build releasable, so a smoke test cannot be shipped by mistake.
 
 `build.py` fails if a row count drifts outside its measured range or a
 verification gate breaks. Regressions in the normalizers produce data that
@@ -337,7 +431,8 @@ employers.
 - No writes through the API.
 - No BLS area enrichment. LCA carries county, and I don't derive what
   isn't there.
-- No auto refresh on DOL drops. Reloading is `build` then `publish`.
+- No auto refresh on DOL drops. Reloading is `build`, `publish`, then
+  `publish_index` and a release.
 
 ## License
 

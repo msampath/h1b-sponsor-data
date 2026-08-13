@@ -89,6 +89,39 @@ def body(obj) -> bytes:
     return json.dumps(obj, separators=(",", ":"), default=str).encode("utf-8")
 
 
+def employer_doc(row, has_jobs: set, has_titles: set) -> dict:
+    """The `e/{key}.json` body, in the column order the employer query
+    selects. Extracted from main()'s loop so tests/etl/test_index_parity.py
+    can hold it against the same employer's line in the downloadable index:
+    both publishers read these columns, and the two must not answer the same
+    question differently."""
+    (eid, key, ein, name, fy, ly, n_lca, n_cert, n_cw, n_den, n_wd,
+     n_new, n_tr, n_cont, n_pwd, n_perm, does_gc, wvp,
+     gc_year, gc_soc, soc_year, trend, level_mix, red_flags) = row
+    return {
+        "employer": {"id": key, "ein": ein, "name": name},
+        "years": {"first": fy, "last": ly},
+        "filings": {
+            "lca": n_lca, "certified": n_cert,
+            "certified_withdrawn": n_cw, "denied": n_den, "withdrawn": n_wd,
+            "new": n_new, "transfer": n_tr, "continued": n_cont,
+        },
+        "green_card": {
+            # absence of a filing is not evidence the employer won't sponsor
+            "evidence": "present" if does_gc else "absent",
+            "pwd": n_pwd, "perm": n_perm,
+            "by_year": gc_year or [], "by_soc": gc_soc or {},
+        },
+        "wage_vs_prevailing": to_num(wvp),
+        "has_jobs": eid in has_jobs,
+        "has_titles": eid in has_titles,
+        "filings_by_soc_year": soc_year or {},
+        "trend": trend or [],
+        "level_mix": level_mix or {},
+        "red_flags": red_flags or {},
+    }
+
+
 class Publisher:
     def __init__(self, dry_run: bool, force: bool, resume: bool = False, limit: int = 0,
              include: tuple[str, ...] = ()):
@@ -464,33 +497,13 @@ def main() -> int:
       ORDER BY e.id
     """
     for r in stream(conn, sql, "emp"):
-        (eid, key, ein, name, fy, ly, n_lca, n_cert, n_cw, n_den, n_wd,
-         n_new, n_tr, n_cont, n_pwd, n_perm, does_gc, wvp,
-         gc_year, gc_soc, soc_year, trend, level_mix, red_flags) = r
-
-        p.put(f"e/{key}.json", body({
-            "employer": {"id": key, "ein": ein, "name": name},
-            "years": {"first": fy, "last": ly},
-            "filings": {
-                "lca": n_lca, "certified": n_cert,
-                "certified_withdrawn": n_cw, "denied": n_den, "withdrawn": n_wd,
-                "new": n_new, "transfer": n_tr, "continued": n_cont,
-            },
-            "green_card": {
-                # absence of a filing is not evidence the employer won't sponsor
-                "evidence": "present" if does_gc else "absent",
-                "pwd": n_pwd, "perm": n_perm,
-                "by_year": gc_year or [], "by_soc": gc_soc or {},
-            },
-            "wage_vs_prevailing": to_num(wvp),
-            "has_jobs": eid in has_jobs,
-            "has_titles": eid in has_titles,
-            "filings_by_soc_year": soc_year or {},
-            "trend": trend or [],
-            "level_mix": level_mix or {},
-            "red_flags": red_flags or {},
-        }))
-        search_entries.append((norm_name(name), (n_lca or 0, key, ein, name)))
+        doc = employer_doc(r, has_jobs, has_titles)
+        emp = doc["employer"]
+        p.put(f"e/{emp['id']}.json", body(doc))
+        search_entries.append((
+            norm_name(emp["name"]),
+            (doc["filings"]["lca"] or 0, emp["id"], emp["ein"], emp["name"]),
+        ))
 
     # ── per-employer jobs / titles ───────────────────────────────────────
     print("employer jobs ...", flush=True)

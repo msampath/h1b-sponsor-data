@@ -50,6 +50,26 @@ python etl/build.py
 normalizers were derived against (its `EXPECTED` gates and the year-coverage
 check). If DOL renames a column in a future drop, step 2 is where it surfaces.
 
+## Quarterly refresh
+
+DOL publishes a new quarter roughly every three months. The whole cycle:
+
+1. Download the new files and `COPY` them in, as above.
+2. `python etl/build.py` — rebuilds `sponsors` and re-runs the gates.
+3. `python etl/publish.py` — manifest diffed, so it uploads only what moved.
+4. Bump `DATA_QUARTER` in `etl/publish_index.py` to the quarter this build
+   now covers, and update the "covers FY... through ..." line above. That
+   constant names the artifact and tags the release, and it is the only
+   thing telling a client its downloaded copy is stale.
+5. `python etl/publish_index.py`, then cut the release (README,
+   "Downloadable index" → "Cutting a release").
+
+The downloadable index is a projection of `sponsors.employer_profile`, the
+same table the `e/{key}.json` API objects are rendered from, which is in
+turn built from the DOL files above. It introduces no data of its own.
+`tests/etl/test_index_parity.py` is what keeps the two projections from
+answering the same question differently.
+
 ## What the pipeline never does
 
 The raw tables are read-only to everything in this repo: `build.py` creates

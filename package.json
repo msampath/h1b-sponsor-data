@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "etl:publish": "python etl/publish.py",
-    "etl:build": "python etl/build.py"
+    "etl:build": "python etl/build.py",
+    "etl:index": "python etl/publish_index.py"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260801.1",
