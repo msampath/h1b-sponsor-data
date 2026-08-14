@@ -1,7 +1,7 @@
 # h1b-sponsor-data
 
 A rate limited public API over six years of DOL immigration disclosures: H-1B
-LCA, PWD, and PERM (signals of immigration support by employers). 335,626 employers, 1.87M wage rows, 759,638 green card
+LCA, PWD, and PERM (signals of immigration support by employers). 335,626 employers, 1.85M wage rows, 759,638 green card
 filings. Cloudflare Workers and R2, free tier
 
 **Updated as of latest disclosure data from DOL as of Q2 FY2026**
@@ -30,7 +30,7 @@ in the endpoints above. The opaque key is a hash of the name and not a
 readable slug, since many of these employers are sole proprietorships named
 after a person.
 
-The profile carries `has_jobs` and `has_titles` booleans. 42% of employers
+The profile carries `has_jobs` and `has_titles` booleans. 47% of employers
 have green-card filings but no LCA rows, so their `/jobs` and `/titles`
 subresources are absent, and the flags tell that apart from a bad id.
 
@@ -101,27 +101,37 @@ keys on a visitor's behalf. If any of that gets in your way, email
 Every call to the API tells this service which employers someone is looking
 up, and someone looking up sponsorship history is telling you they need a
 visa. The headline numbers do not need a service to answer them: 12 fields
-for all 335,626 employers is 7.9 MB gzipped, so a client downloads the file
+for all 335,626 employers is 7.9 MiB gzipped, so a client downloads the file
 once a quarter and answers locally. Nothing about the query leaves the
 machine.
 
 ```bash
-curl -sL https://github.com/msampath/h1b-sponsor-data/releases/latest/download/index-latest.json
-curl -OL https://github.com/msampath/h1b-sponsor-data/releases/latest/download/index-2026Q2.ndjson.gz
+BASE=https://github.com/msampath/h1b-sponsor-data/releases/download/index-latest
+curl -sL "$BASE/index-latest.json"
+curl -OL "$BASE/index-2026Q2.ndjson.gz"
 ```
 
 `index-latest.json` is the pointer: `{version, built_at, employers, bytes,
 sha256, filename}`. Read `filename` out of it instead of hardcoding the
 quarter, and check the download against `sha256`.
 
+`index-latest` is a permanent tag, not a version. Its assets are replaced
+in place each quarter, so the two URLs above never change. The quarter
+files accumulate on it, so an older build stays fetchable by name after a
+newer one lands.
+
 The data is gzipped NDJSON, one employer per line, sorted by normalized name
 then key. The normalization is `norm_name` in `etl/publish.py`, the same one
-`/employers/search` buckets by, so a local scan and a search agree on what a
-name is. A cold lookup by streaming scan is 0.34s and 40 companies in one
-pass is 3.37s, which is why this is one file and not sharded.
+`/employers/search` buckets by, so the file arrives in the order the search
+buckets are published in and two builds of identical data produce identical
+bytes. It is not an index a client can stop reading early: `norm_name` keeps
+spaces where a consumer normalizer may not, and a name matched part-way
+through can still be beaten by a higher-evidence entity further down. A
+lookup is a whole pass, a couple of seconds on the shipped build, which is
+why this is one file and not sharded.
 
 ```json
-{"k":"204938068","n":"Amazon Web Services, Inc.","fy":2019,"ly":2026,"lca":24611,"pwd":4313,"perm":3828,"gc":true,"sv":false,"sh":0.02,"ns":512,"nt":24611}
+{"k":"204938068","n":"Amazon Web Services, Inc.","fy":2019,"ly":2026,"filed":25358,"cert":24611,"pwd":4313,"perm":3828,"gc":true,"sv":false,"sh":0,"ns":9}
 ```
 
 | Field | Is |
@@ -129,19 +139,25 @@ pass is 3.37s, which is why this is one file and not sharded.
 | `k` | employer key, the same `:id` the API endpoints take |
 | `n` | employer name as DOL published it |
 | `fy` / `ly` | first and last year seen, across LCA and green card filings |
-| `lca` | H-1B filings, resolved as `certified ?? lca ?? 0` against the API's `filings` block |
+| `filed` | H-1B filings the employer submitted, the API's `filings.lca` |
+| `cert` | how many of those came back certified, the API's `filings.certified` |
 | `pwd` / `perm` | prevailing wage and PERM filings, the two green card steps |
 | `gc` | true when either exists, i.e. `green_card.evidence == "present"` |
 | `sv` | the `staffing_shop` red flag |
-| `sh` / `ns` / `nt` | its evidence: secondary entity share, that count, and the LCA total it is a share of |
+| `sh` / `ns` | its evidence: `ns`, the secondary entity count, and `sh`, that count over `filed` rounded to 3 decimals |
 
-`lca` is a certified count, since `n_certified` is never null and so the
-coalesce never reaches past it. `nt` is the unfiltered LCA total, so the two
-differ for the 50,755 employers carrying a denial or a withdrawal. That is
-not a discrepancy, it is the two numbers the API also reports separately as
-`filings.certified` and `filings.lca`. The coalesce is resolved at build
-time on purpose: a local answer and an HTTP answer to the same question must
-not come out differently.
+`filed` and `cert` are published side by side rather than resolved into one
+headline, and they differ for the 50,755 employers carrying a denial or a
+withdrawal. Filing is the employer's act: it is what says this employer
+sponsors, and it is what a client should count. What happened to a filing
+afterwards is somebody else's decision, a USCIS denial or a candidate who
+took another offer, so `cert` is reported next to `filed` rather than in
+place of it. Publishing the coalesce instead described 3,777 employers that
+had filed as having no record at all.
+
+`sh` is `ns / filed` rounded, so the `nt` field earlier drafts carried was a second
+copy of `filed`; it is gone, and the single `lca` field it sat beside is now
+the `filed` / `cert` pair. Still 12 fields per employer.
 
 Not in the file: jobs, titles, wage benchmarks, and typeahead search. Those
 are per-request shapes with no small precomputed form, and they stay on the
@@ -151,33 +167,31 @@ as everything else here.
 
 ### Cutting a release
 
-Build, then attach both files to a release tagged with the quarter:
+Build, then replace the assets on the permanent tag:
 
 ```bash
 python etl/publish_index.py          # -> etl/dist/, ~15s
 VERSION=$(python -c "import json;print(json.load(open('etl/dist/index-latest.json'))['version'])")
 
-gh release create "$VERSION" \
+# First time only, to create the tag:
+# gh release create index-latest --repo msampath/h1b-sponsor-data \
+#   --title "Employer index" \
+#   --notes "Per-employer headline numbers derived from DOL OFLC disclosure data."
+
+gh release upload index-latest \
   --repo msampath/h1b-sponsor-data \
-  --title "Employer index $VERSION" \
-  --notes "Per-employer headline numbers, FY2020 through $VERSION. Derived from DOL OFLC disclosure data." \
-  "etl/dist/index-$VERSION.ndjson.gz" etl/dist/index-latest.json
+  "etl/dist/index-$VERSION.ndjson.gz" etl/dist/index-latest.json --clobber
 ```
 
 Re-running a build over unchanged data produces byte-identical output (the
 gzip header carries no mtime and no filename), so a re-publish that changed
-nothing does not make every client re-download. To replace assets on a tag
-that already exists:
+nothing does not make every client re-download.
 
-```bash
-gh release upload "$VERSION" "etl/dist/index-$VERSION.ndjson.gz" \
-  etl/dist/index-latest.json --clobber
-```
-
-Accepted constraint: the `releases/latest/download/` path resolves to the
-newest release of any kind, so data releases have to be the only ones in
-this repo. If code releases ever get tagged here, mark them `--prerelease`
-or the documented client path starts 404ing.
+A fixed tag is what makes this safe. `releases/latest/download/` resolves
+to the newest release of any kind, so the first code release tagged in this
+repo would have silently pointed every client at an asset that is not
+there. Naming the tag removes that failure mode instead of documenting
+around it.
 
 ## Architecture
 
@@ -195,7 +209,7 @@ lca (Postgres)
                        └─ etl/publish_index.py
                                v
                           GitHub Release: index-<quarter>.ndjson.gz
-                          335k employers, 7.9 MB, scanned on the client
+                          335k employers, 7.9 MiB, scanned on the client
 ```
 
 R2 instead of D1, because D1's free tier is 100,000 row writes per day and
@@ -324,7 +338,7 @@ doesn't parse. Per-SOC breakdowns (`gc_by_soc`, `sponsors.gc_filings`)
 restrict to well-formed SOC. Junk-SOC filings still count toward whether
 an employer sponsors, they just don't get bucketed into an occupation.
 
-Employer universe: built from all three sources. 42% have GC filings but
+Employer universe: built from all three sources. 47% have GC filings but
 no LCA rows.
 
 Wages: every case status is included, since the offered wage is a federal

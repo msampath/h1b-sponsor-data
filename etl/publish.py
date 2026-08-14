@@ -122,6 +122,31 @@ def employer_doc(row, has_jobs: set, has_titles: set) -> dict:
     }
 
 
+def search_volume(doc) -> int:
+    """The volume the employer search buckets rank by: all the sponsorship
+    evidence there is, LCA filings plus the two green card steps.
+
+    Distinct employers share a normalized name constantly (36,535 groups in
+    the 2026Q2 build) and the resolver takes the first match in bucket order,
+    so the bucket order decides which of them a lookup lands on. Summing
+    exactly what the consumer's tier sums is what makes it impossible, by
+    construction, to seat an entity ahead of a same-named sibling that has
+    more evidence than it does. Any narrower key can, and did: ranking by
+    certified alone put a strictly lower-evidence entity first for 6,135 of
+    those groups, and ranking by raw n_lca for 5,844.
+
+    Green card only employers are why no single column works. 156,616
+    employers in the build have no LCA rows at all but do have PWD or PERM
+    filings, so both n_lca and n_certified read 0 for them and they sort as
+    if they had never sponsored anyone: they are the right answer in 4,836 of
+    the 6,135 groups above. lib/index.mjs in the career-ops plugin sorts its
+    local candidates by this same sum, so a name resolves to the same entity
+    over HTTP and on disk."""
+    return ((doc["filings"]["lca"] or 0)
+            + (doc["green_card"]["pwd"] or 0)
+            + (doc["green_card"]["perm"] or 0))
+
+
 class Publisher:
     def __init__(self, dry_run: bool, force: bool, resume: bool = False, limit: int = 0,
              include: tuple[str, ...] = ()):
@@ -502,7 +527,7 @@ def main() -> int:
         p.put(f"e/{emp['id']}.json", body(doc))
         search_entries.append((
             norm_name(emp["name"]),
-            (doc["filings"]["lca"] or 0, emp["id"], emp["ein"], emp["name"]),
+            (search_volume(doc), emp["id"], emp["ein"], emp["name"]),
         ))
 
     # ── per-employer jobs / titles ───────────────────────────────────────

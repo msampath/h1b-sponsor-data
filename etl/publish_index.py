@@ -2,8 +2,8 @@
 
 Every API lookup tells this service which employers someone is checking,
 and someone checking sponsorship history is telling you they need a visa.
-For the one tier where that is avoidable — the headline numbers, 12 fields
-per employer — the whole table fits in ~8 MB gzipped, so a client downloads
+For the one tier where that is avoidable (the headline numbers, 12 fields
+per employer), the whole table fits in ~8 MB gzipped, so a client downloads
 it once a quarter and answers locally. The API stays for the tiers that
 genuinely need a service: jobs, titles, wage benchmarks, and typeahead.
 
@@ -16,7 +16,7 @@ Usage:
     python etl/publish_index.py --out DIR        # write somewhere else
     python etl/publish_index.py --limit 1000     # small run; no pointer file
 
-Then attach the two files to a release — see README, "Downloadable index".
+Then attach the two files to a release. See README, "Downloadable index".
 """
 
 from __future__ import annotations
@@ -55,13 +55,19 @@ DATA_QUARTER = "2026Q2"
 SQL = """
   SELECT e.key, e.name,
          p.first_year, p.last_year,
-         -- The JS consumer resolves `filings.certified ?? filings.lca ?? 0`
-         -- against the e/{key}.json tier. Resolving it HERE means the local
-         -- file and the HTTP path cannot answer the same question two
-         -- different ways. Both columns are NOT NULL today, so this reads
-         -- n_certified straight through; the COALESCE is written out anyway
-         -- because the guarantee it encodes is the JS one, not the schema's.
-         COALESCE(p.n_certified, p.n_lca, 0) AS lca,
+         -- Two numbers, published side by side rather than resolved into one.
+         -- `filed` is every LCA the employer filed, and filing IS the
+         -- employer's act of willingness to sponsor, so it is the number the
+         -- consumer's tier sums. `cert` is what happened to those filings
+         -- afterwards, carried for display next to it: a denial is USCIS's
+         -- decision and a withdrawal is usually the candidate taking another
+         -- offer or a cancelled req, so neither is evidence that this
+         -- employer will not sponsor. Publishing COALESCE(n_certified,
+         -- n_lca) as the single headline, which is what this used to do,
+         -- reported 3,777 employers that had filed as tier `none`, i.e. "the
+         -- DOL data shows nothing" for employers the DOL data has plenty on.
+         COALESCE(p.n_lca, 0) AS filed,
+         COALESCE(p.n_certified, 0) AS cert,
          COALESCE(p.n_pwd, 0), COALESCE(p.n_perm, 0),
          p.does_gc,
          p.red_flags -> 'staffing_shop' AS staffing
@@ -73,21 +79,25 @@ SQL = """
 def record(row) -> dict:
     """One index line, in the column order SQL selects.
 
-    Two-letter field names: the same 12 keys repeat 335,626 times, so their
-    text is a real share of the file rather than a rounding error.
+    Short field names: the same 12 keys repeat 335,626 times, so their text
+    is a real share of the file rather than a rounding error.
     """
-    key, name, fy, ly, lca, n_pwd, n_perm, does_gc, staffing = row
+    key, name, fy, ly, filed, cert, n_pwd, n_perm, does_gc, staffing = row
     st = staffing or {}
     return {
-        "k": key, "n": name, "fy": fy, "ly": ly, "lca": lca,
+        "k": key, "n": name, "fy": fy, "ly": ly,
+        "filed": filed, "cert": cert,
         "pwd": n_pwd, "perm": n_perm, "gc": bool(does_gc),
         # An employer with no LCA rows has no staffing evidence either way.
         # Absent reads as false/0, which is what the API's red_flags block
         # already reports for the same employer.
         "sv": bool(st.get("value")),
         "sh": st.get("share") or 0,
+        # The share's denominator is `filed`: sql/03_populate.sql builds the
+        # staffing_shop block as n_secondary / n_lca, so n_total was always a
+        # second copy of the raw LCA count. It is dropped rather than shipped
+        # twice; a consumer that needs it reads `filed`.
         "ns": st.get("n_secondary") or 0,
-        "nt": st.get("n_total") or 0,
     }
 
 
@@ -95,12 +105,13 @@ def build(conn, limit: int = 0) -> list[str]:
     """Stream every employer, return the NDJSON lines sorted by
     (norm_name(name), key).
 
-    Sorted is what makes a scan-based local lookup honest: a client reading
-    the file top to bottom knows when it has passed the name it wants. Sort
-    on the normalized name so that order matches the `s/` search buckets,
-    and break ties on key, because distinct employers do share a normalized
-    name (README, "name variants stay split") and an unstable tie would
-    change the bytes between two builds of identical data.
+    Sort on the normalized name so the file arrives in the same order the
+    `s/` search buckets are published in, and break ties on key, because
+    distinct employers do share a normalized name (README, "name variants
+    stay split") and an unstable tie would change the bytes between two
+    builds of identical data. The order is not an early-exit index: a
+    consumer normalizing differently, or one that has to pick the
+    highest-evidence entity out of a shared name, reads the whole file.
     """
     rows: list[tuple[str, str, str]] = []
     for row in stream(conn, SQL, "empindex"):
