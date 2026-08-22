@@ -33,6 +33,7 @@ from itertools import groupby
 from pathlib import Path
 
 import psycopg2
+import sentry_sdk
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -476,6 +477,7 @@ def require_env(names):
 
 def main() -> int:
     load_dotenv(ROOT / ".env")
+    sentry_sdk.init(dsn=os.environ.get("SENTRY_DSN", ""))
     args = parse_args()
     require_env(REQUIRED_PG)
     if not args.dry_run:

@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import psycopg2
+import sentry_sdk
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -58,6 +59,7 @@ def _require_env(names):
 
 def main() -> int:
     load_dotenv(ROOT / ".env")
+    sentry_sdk.init(dsn=os.environ.get("SENTRY_DSN", ""))
     _require_env(["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD"])
     dsn = dict(
         host=os.environ["POSTGRES_HOST"],
